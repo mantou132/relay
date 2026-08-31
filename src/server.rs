@@ -1,13 +1,10 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::{
-        Query, State, WebSocketUpgrade,
+        ConnectInfo, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
@@ -17,7 +14,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use relay::{ClientFrame, Endpoint, ServerFrame};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
+use tracing::{Instrument, debug, error, info};
 
 use crate::{
     config::{Args, Limits},
@@ -32,9 +30,7 @@ const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 struct AppState {
     database: Arc<Database>,
     hub: Arc<Hub>,
-    /// Serializes the short store/register/forward critical section so a
-    /// message cannot land between a reconnect's database replay and its hub
-    /// registration.
+    /// Prevents a message from landing between reconnect replay and hub registration.
     delivery: Arc<Mutex<()>>,
 }
 
@@ -44,14 +40,9 @@ struct ConnectQuery {
     endpoint: Endpoint,
 }
 
-fn validate_connection(query: &ConnectQuery) -> Result<()> {
-    anyhow::ensure!(!query.id.is_empty(), "id must not be empty");
-    anyhow::ensure!(query.id.len() <= MAX_ID_BYTES, "id is too long");
-    Ok(())
-}
-
 async fn websocket_handler(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Query(query): Query<ConnectQuery>,
     websocket: WebSocketUpgrade,
 ) -> Response {
@@ -60,31 +51,56 @@ async fn websocket_handler(
     }
     websocket
         .max_message_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| serve_socket(state, query, socket))
+        .on_upgrade(move |socket| serve_socket(state, query, peer_addr, socket))
 }
 
-async fn serve_socket(state: AppState, query: ConnectQuery, mut socket: WebSocket) {
+fn validate_connection(query: &ConnectQuery) -> Result<()> {
+    anyhow::ensure!(!query.id.is_empty(), "id must not be empty");
+    anyhow::ensure!(query.id.len() <= MAX_ID_BYTES, "id is too long");
+    Ok(())
+}
+
+async fn serve_socket(
+    state: AppState,
+    query: ConnectQuery,
+    peer_addr: SocketAddr,
+    socket: WebSocket,
+) {
+    let span = tracing::debug_span!(
+        "websocket",
+        relay_id = %query.id,
+        endpoint = %query.endpoint,
+        %peer_addr
+    );
+    serve_socket_inner(state, query, socket)
+        .instrument(span)
+        .await;
+}
+
+async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: WebSocket) {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let token = {
-        let _delivery = state.delivery.lock().expect("delivery lock poisoned");
+    let registration = {
+        let _delivery = state.delivery.lock().await;
         if state.hub.contains(&query.id, query.endpoint) {
             None
         } else {
-            let pending = match state.database.pending(&query.id, query.endpoint) {
+            let pending = match state.database.pending(&query.id, query.endpoint).await {
                 Ok(pending) => pending,
                 Err(error) => {
-                    eprintln!("failed to read pending relay messages: {error:#}");
+                    error!(%error, "failed to read pending relay messages");
                     return;
                 }
             };
-            Some(
-                state
-                    .hub
-                    .register(&query.id, query.endpoint, tx.clone(), pending),
-            )
+            let replayed = pending.len();
+            let token = state
+                .hub
+                .register(&query.id, query.endpoint, tx.clone(), pending);
+            Some((token, replayed))
         }
     };
-    let Some(token) = token else {
+
+    let Some((token, replayed)) = registration else {
+        debug!("WebSocket connection rejected: endpoint already connected");
         let conflict = ServerFrame::Error {
             message: "connection_conflict: this id and endpoint already has an active connection"
                 .to_string(),
@@ -95,6 +111,8 @@ async fn serve_socket(state: AppState, query: ConnectQuery, mut socket: WebSocke
         let _ = socket.send(Message::Close(None)).await;
         return;
     };
+    debug!(replayed_messages = replayed, "WebSocket endpoint connected");
+
     let (mut sink, mut stream) = socket.split();
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -113,27 +131,35 @@ async fn serve_socket(state: AppState, query: ConnectQuery, mut socket: WebSocke
         }
         let message = match result {
             Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Close(_)) => break,
+            Err(error) => {
+                debug!(%error, "WebSocket read failed");
+                break;
+            }
             Ok(_) => continue,
         };
         let frame = match serde_json::from_str::<ClientFrame>(&message) {
             Ok(frame) => frame,
             Err(error) => {
+                debug!(%error, "client sent an invalid frame");
                 let _ = tx.send(ServerFrame::Error {
                     message: format!("invalid frame: {error}"),
                 });
                 continue;
             }
         };
+
         match frame {
             ClientFrame::Message {
                 message_id,
                 payload,
             } => {
-                let _delivery = state.delivery.lock().expect("delivery lock poisoned");
+                debug!(%message_id, payload = %payload, "message received");
+                let _delivery = state.delivery.lock().await;
                 match state
                     .database
                     .store(&query.id, query.endpoint, &message_id, &payload)
+                    .await
                 {
                     Ok(stored) => {
                         let _ = tx.send(ServerFrame::Stored {
@@ -148,6 +174,7 @@ async fn serve_socket(state: AppState, query: ConnectQuery, mut socket: WebSocke
                         }
                     }
                     Err(error) => {
+                        debug!(%message_id, %error, "message rejected");
                         let _ = tx.send(ServerFrame::Error {
                             message: error.to_string(),
                         });
@@ -155,11 +182,14 @@ async fn serve_socket(state: AppState, query: ConnectQuery, mut socket: WebSocke
                 }
             }
             ClientFrame::Ack { sequence } => {
-                let _delivery = state.delivery.lock().expect("delivery lock poisoned");
+                debug!(sequence, "acknowledgement received");
+                let _delivery = state.delivery.lock().await;
                 if let Err(error) = state
                     .database
                     .acknowledge(&query.id, query.endpoint, sequence)
+                    .await
                 {
+                    debug!(sequence, %error, "acknowledgement failed");
                     let _ = tx.send(ServerFrame::Error {
                         message: error.to_string(),
                     });
@@ -170,12 +200,14 @@ async fn serve_socket(state: AppState, query: ConnectQuery, mut socket: WebSocke
 
     state.hub.remove(&query.id, query.endpoint, token);
     writer.abort();
+    let _ = writer.await;
+    debug!("WebSocket endpoint disconnected");
 }
 
 pub(crate) async fn run(args: Args) -> Result<()> {
     let limits = Limits::from_args(&args)?;
-    let database = Arc::new(Database::open(&args.database, limits)?);
-    report_cleanup(database.cleanup()?);
+    let database = Arc::new(Database::open(&args.database, limits).await?);
+    report_cleanup(database.cleanup().await?);
     spawn_cleanup(
         database.clone(),
         Duration::from_secs(args.cleanup_interval_secs),
@@ -192,8 +224,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("failed to bind {}", args.bind))?;
-    println!("relay listening on ws://{}/ws", args.bind);
-    axum::serve(listener, router).await?;
+    info!(bind = %args.bind, "relay listening");
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -206,11 +242,9 @@ fn spawn_cleanup(database: Arc<Database>, cleanup_interval: Duration) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let database = database.clone();
-            match tokio::task::spawn_blocking(move || database.cleanup()).await {
-                Ok(Ok(stats)) => report_cleanup(stats),
-                Ok(Err(error)) => eprintln!("relay cleanup failed: {error:#}"),
-                Err(error) => eprintln!("relay cleanup task failed: {error}"),
+            match database.cleanup().await {
+                Ok(stats) => report_cleanup(stats),
+                Err(error) => error!(%error, "relay cleanup failed"),
             }
         }
     });
@@ -218,9 +252,10 @@ fn spawn_cleanup(database: Arc<Database>, cleanup_interval: Duration) {
 
 fn report_cleanup(stats: CleanupStats) {
     if stats.expired_pending > 0 || stats.expired_receipts > 0 {
-        eprintln!(
-            "relay cleanup removed {} pending messages and {} receipts",
-            stats.expired_pending, stats.expired_receipts
+        info!(
+            expired_pending = stats.expired_pending,
+            expired_receipts = stats.expired_receipts,
+            "relay cleanup completed"
         );
     }
 }
