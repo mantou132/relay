@@ -1,17 +1,27 @@
 use std::{
     path::Path,
-    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use relay::{Endpoint, ServerFrame};
-use rusqlite::{Connection, OptionalExtension, params};
+use sea_orm::{
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database as SeaDatabase,
+    DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Schema,
+    TransactionTrait,
+    sqlx::sqlite::{SqliteAutoVacuum, SqliteJournalMode, SqliteSynchronous},
+};
 use serde_json::Value;
 
-use crate::config::Limits;
+use crate::{
+    config::Limits,
+    entity::{counter, pending_message, receipt},
+};
 
 const MAX_ID_BYTES: usize = 256;
+const CLEANUP_DELETE_BATCH_SIZE: usize = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredMessage {
@@ -36,12 +46,12 @@ pub(crate) struct StoreResult {
 }
 
 pub(crate) struct Database {
-    connection: Mutex<Connection>,
+    connection: DatabaseConnection,
     limits: Limits,
 }
 
 impl Database {
-    pub(crate) fn open(path: &Path, limits: Limits) -> Result<Self> {
+    pub(crate) async fn open(path: &Path, limits: Limits) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -53,112 +63,34 @@ impl Database {
                 )
             })?;
         }
-        let connection = Connection::open(path)
+
+        // The actual path is supplied through SQLite's typed options so paths
+        // containing URL-reserved or non-UTF-8 characters remain valid.
+        let database_path = path.to_owned();
+        let mut options = ConnectOptions::new("sqlite://relay.sqlite3");
+        options
+            // A single async connection preserves SQLite's write ordering
+            // without blocking a Tokio worker on a synchronous mutex.
+            .max_connections(1)
+            .min_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(move |options| {
+                options
+                    .filename(database_path.clone())
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Full)
+                    .auto_vacuum(SqliteAutoVacuum::Full)
+            });
+        let connection = SeaDatabase::connect(options)
+            .await
             .with_context(|| format!("failed to open relay database {}", path.display()))?;
-        connection.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS counters (
-               relay_id TEXT NOT NULL,
-               destination TEXT NOT NULL,
-               next_sequence INTEGER NOT NULL,
-               PRIMARY KEY (relay_id, destination)
-             );
-             CREATE TABLE IF NOT EXISTS receipts (
-               relay_id TEXT NOT NULL,
-               source TEXT NOT NULL,
-               message_id TEXT NOT NULL,
-               destination TEXT NOT NULL,
-               sequence INTEGER NOT NULL,
-               payload TEXT NOT NULL,
-               created_at INTEGER NOT NULL,
-               PRIMARY KEY (relay_id, source, message_id)
-             );
-             CREATE TABLE IF NOT EXISTS pending_messages (
-               relay_id TEXT NOT NULL,
-               destination TEXT NOT NULL,
-               sequence INTEGER NOT NULL,
-               message_id TEXT NOT NULL,
-               payload TEXT NOT NULL,
-               payload_bytes INTEGER NOT NULL,
-               created_at INTEGER NOT NULL,
-               PRIMARY KEY (relay_id, destination, sequence)
-             );",
-        )?;
-        ensure_column(
-            &connection,
-            "receipts",
-            "created_at",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "pending_messages",
-            "payload_bytes",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "pending_messages",
-            "created_at",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        // Preserve queued deliveries created by the earlier role-based wire
-        // format when upgrading to numbered endpoints.
-        connection.execute_batch(
-            "UPDATE counters
-             SET destination = CASE destination
-               WHEN 'host' THEN '1'
-               WHEN 'app' THEN '2'
-               ELSE destination
-             END
-             WHERE destination IN ('host', 'app');
-             UPDATE receipts
-             SET source = CASE source
-                   WHEN 'host' THEN '1'
-                   WHEN 'app' THEN '2'
-                   ELSE source
-                 END,
-                 destination = CASE destination
-                   WHEN 'host' THEN '1'
-                   WHEN 'app' THEN '2'
-                   ELSE destination
-                 END
-             WHERE source IN ('host', 'app') OR destination IN ('host', 'app');
-             UPDATE pending_messages
-             SET destination = CASE destination
-               WHEN 'host' THEN '1'
-               WHEN 'app' THEN '2'
-               ELSE destination
-             END
-             WHERE destination IN ('host', 'app');",
-        )?;
-        let now = unix_timestamp()?;
-        connection.execute(
-            "UPDATE receipts SET created_at = ?1 WHERE created_at = 0",
-            params![now],
-        )?;
-        connection.execute(
-            "UPDATE pending_messages
-             SET created_at = CASE WHEN created_at = 0 THEN ?1 ELSE created_at END,
-                 payload_bytes = length(CAST(payload AS BLOB))
-             WHERE created_at = 0 OR payload_bytes = 0",
-            params![now],
-        )?;
-        connection.execute_batch(
-            "CREATE INDEX IF NOT EXISTS pending_messages_created_at
-             ON pending_messages(created_at);
-             CREATE INDEX IF NOT EXISTS receipts_created_at
-             ON receipts(created_at);",
-        )?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-            limits,
-        })
+
+        initialize_schema(&connection).await?;
+        Ok(Self { connection, limits })
     }
 
-    pub(crate) fn store(
+    pub(crate) async fn store(
         &self,
         relay_id: &str,
         source: Endpoint,
@@ -166,42 +98,40 @@ impl Database {
         payload: &Value,
     ) -> Result<StoreResult> {
         validate_message_id(message_id)?;
-        let destination = source.opposite();
-        let payload_json = serde_json::to_string(payload)?;
-        let payload_bytes = i64::try_from(payload_json.len()).context("payload is too large")?;
+        let destination = source.opposite().to_string();
+        let source = source.to_string();
+        let payload_bytes =
+            i64::try_from(serde_json::to_vec(payload)?.len()).context("payload is too large")?;
         let now = unix_timestamp()?;
-        let mut connection = self.connection.lock().expect("database lock poisoned");
-        let transaction = connection.transaction()?;
+        let transaction = self.connection.begin().await?;
 
-        let receipt = transaction
-            .query_row(
-                "SELECT destination, sequence, payload FROM receipts
-                 WHERE relay_id = ?1 AND source = ?2 AND message_id = ?3",
-                params![relay_id, source.to_string(), message_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let stored_receipt = receipt::Entity::find_by_id((
+            relay_id.to_owned(),
+            source.clone(),
+            message_id.to_owned(),
+        ))
+        .one(&transaction)
+        .await?;
 
-        let sequence = if let Some((stored_destination, sequence, stored_payload)) = receipt {
+        let sequence = if let Some(stored) = stored_receipt {
             anyhow::ensure!(
-                stored_destination == destination.to_string() && stored_payload == payload_json,
+                stored.destination == destination && stored.payload == *payload,
                 "message_id was already used with a different payload"
             );
-            sequence
+            stored.sequence
         } else {
-            let (pending_count, pending_bytes) = transaction.query_row(
-                "SELECT count(*), coalesce(sum(payload_bytes), 0)
-                 FROM pending_messages
-                 WHERE relay_id = ?1 AND destination = ?2",
-                params![relay_id, destination.to_string()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )?;
+            let (pending_count, pending_bytes): (i64, Option<i64>) =
+                pending_message::Entity::find()
+                    .select_only()
+                    .column_as(pending_message::Column::Sequence.count(), "pending_count")
+                    .column_as(pending_message::Column::PayloadBytes.sum(), "pending_bytes")
+                    .filter(pending_message::Column::RelayId.eq(relay_id))
+                    .filter(pending_message::Column::Destination.eq(&destination))
+                    .into_tuple()
+                    .one(&transaction)
+                    .await?
+                    .context("queue totals query returned no row")?;
+            let pending_bytes = pending_bytes.unwrap_or(0);
             anyhow::ensure!(
                 pending_count < self.limits.max_pending_messages,
                 "queue_full: pending message count limit reached"
@@ -211,146 +141,152 @@ impl Database {
                     && pending_bytes <= self.limits.max_pending_bytes.saturating_sub(payload_bytes),
                 "queue_full: pending payload byte limit reached"
             );
-            let current = transaction
-                .query_row(
-                    "SELECT next_sequence FROM counters
-                     WHERE relay_id = ?1 AND destination = ?2",
-                    params![relay_id, destination.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            let sequence = current
+
+            let counter = counter::Entity::find_by_id((relay_id.to_owned(), destination.clone()))
+                .one(&transaction)
+                .await?;
+            let sequence = counter
+                .as_ref()
+                .map_or(0, |counter| counter.next_sequence)
                 .checked_add(1)
                 .context("relay sequence space exhausted")?;
-            transaction.execute(
-                "INSERT INTO counters (relay_id, destination, next_sequence)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(relay_id, destination)
-                 DO UPDATE SET next_sequence = excluded.next_sequence",
-                params![relay_id, destination.to_string(), sequence],
-            )?;
-            transaction.execute(
-                "INSERT INTO receipts
-                 (relay_id, source, message_id, destination, sequence, payload, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    relay_id,
-                    source.to_string(),
-                    message_id,
-                    destination.to_string(),
-                    sequence,
-                    payload_json,
-                    now,
-                ],
-            )?;
-            transaction.execute(
-                "INSERT INTO pending_messages
-                 (relay_id, destination, sequence, message_id, payload, payload_bytes, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    relay_id,
-                    destination.to_string(),
-                    sequence,
-                    message_id,
-                    payload_json,
-                    payload_bytes,
-                    now,
-                ],
-            )?;
+            if let Some(counter) = counter {
+                let mut counter = counter.into_active_model();
+                counter.next_sequence = Set(sequence);
+                counter.update(&transaction).await?;
+            } else {
+                counter::ActiveModel {
+                    relay_id: Set(relay_id.to_owned()),
+                    destination: Set(destination.clone()),
+                    next_sequence: Set(sequence),
+                }
+                .insert(&transaction)
+                .await?;
+            }
+
+            receipt::ActiveModel {
+                relay_id: Set(relay_id.to_owned()),
+                source: Set(source),
+                message_id: Set(message_id.to_owned()),
+                destination: Set(destination.clone()),
+                sequence: Set(sequence),
+                payload: Set(payload.clone()),
+                created_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+            pending_message::ActiveModel {
+                relay_id: Set(relay_id.to_owned()),
+                destination: Set(destination.clone()),
+                sequence: Set(sequence),
+                message_id: Set(message_id.to_owned()),
+                payload: Set(payload.clone()),
+                payload_bytes: Set(payload_bytes),
+                created_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
             sequence
         };
 
-        let pending = transaction
-            .query_row(
-                "SELECT message_id, sequence, payload FROM pending_messages
-                 WHERE relay_id = ?1 AND destination = ?2 AND sequence = ?3",
-                params![relay_id, destination.to_string(), sequence],
-                row_to_message,
-            )
-            .optional()?;
-        transaction.commit()?;
+        let pending =
+            pending_message::Entity::find_by_id((relay_id.to_owned(), destination, sequence))
+                .one(&transaction)
+                .await?
+                .map(StoredMessage::try_from)
+                .transpose()?;
+        transaction.commit().await?;
         Ok(StoreResult { pending })
     }
 
-    pub(crate) fn pending(
+    pub(crate) async fn pending(
         &self,
         relay_id: &str,
         destination: Endpoint,
     ) -> Result<Vec<StoredMessage>> {
-        let connection = self.connection.lock().expect("database lock poisoned");
-        let mut statement = connection.prepare(
-            "SELECT message_id, sequence, payload FROM pending_messages
-             WHERE relay_id = ?1 AND destination = ?2 ORDER BY sequence",
-        )?;
-        let messages = statement
-            .query_map(params![relay_id, destination.to_string()], row_to_message)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(messages)
+        pending_message::Entity::find()
+            .filter(pending_message::Column::RelayId.eq(relay_id))
+            .filter(pending_message::Column::Destination.eq(destination.to_string()))
+            .order_by_asc(pending_message::Column::Sequence)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(StoredMessage::try_from)
+            .collect()
     }
 
-    pub(crate) fn acknowledge(
+    pub(crate) async fn acknowledge(
         &self,
         relay_id: &str,
         destination: Endpoint,
         sequence: u64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
-        self.connection
-            .lock()
-            .expect("database lock poisoned")
-            .execute(
-                "DELETE FROM pending_messages
-                 WHERE relay_id = ?1 AND destination = ?2 AND sequence <= ?3",
-                params![relay_id, destination.to_string(), sequence],
-            )?;
-        Ok(())
+        let result = pending_message::Entity::delete_many()
+            .filter(pending_message::Column::RelayId.eq(relay_id))
+            .filter(pending_message::Column::Destination.eq(destination.to_string()))
+            .filter(pending_message::Column::Sequence.lte(sequence))
+            .exec(&self.connection)
+            .await?;
+        Ok(result.rows_affected)
     }
 
-    pub(crate) fn cleanup(&self) -> Result<CleanupStats> {
+    pub(crate) async fn cleanup(&self) -> Result<CleanupStats> {
         let now = unix_timestamp()?;
         let pending_cutoff = now.saturating_sub(self.limits.pending_retention_secs);
         let receipt_cutoff = now.saturating_sub(self.limits.receipt_retention_secs);
-        let mut connection = self.connection.lock().expect("database lock poisoned");
-        let transaction = connection.transaction()?;
+        let transaction = self.connection.begin().await?;
 
-        // Remove the receipt together with an expired pending delivery. If the
-        // original sender still has that message, retrying it creates a fresh
-        // delivery instead of acknowledging a queue entry that no longer exists.
-        let expired_pending_receipts = transaction.execute(
-            "DELETE FROM receipts AS receipt
-             WHERE EXISTS (
-               SELECT 1 FROM pending_messages AS pending
-               WHERE pending.relay_id = receipt.relay_id
-                 AND pending.destination = receipt.destination
-                 AND pending.sequence = receipt.sequence
-                 AND pending.created_at < ?1
-             )",
-            params![pending_cutoff],
-        )?;
-        let expired_pending = transaction.execute(
-            "DELETE FROM pending_messages WHERE created_at < ?1",
-            params![pending_cutoff],
-        )?;
-        let expired_receipts = transaction.execute(
-            "DELETE FROM receipts AS receipt
-             WHERE receipt.created_at < ?1
-               AND NOT EXISTS (
-                 SELECT 1 FROM pending_messages AS pending
-                 WHERE pending.relay_id = receipt.relay_id
-                   AND pending.destination = receipt.destination
-                   AND pending.sequence = receipt.sequence
-               )",
-            params![receipt_cutoff],
-        )?;
-        transaction.commit()?;
-        connection.execute_batch(
-            "PRAGMA wal_checkpoint(TRUNCATE);
-             PRAGMA incremental_vacuum(1000);",
-        )?;
+        // Receipts for expired deliveries are removed in bounded batches. A
+        // retry can then create a fresh delivery instead of matching a queue
+        // entry that no longer exists.
+        let expired = pending_message::Entity::find()
+            .select_only()
+            .column(pending_message::Column::RelayId)
+            .column(pending_message::Column::Destination)
+            .column(pending_message::Column::Sequence)
+            .filter(pending_message::Column::CreatedAt.lt(pending_cutoff))
+            .into_tuple::<(String, String, i64)>()
+            .all(&transaction)
+            .await?;
+        let mut expired_pending_receipts = 0_u64;
+        for batch in expired.chunks(CLEANUP_DELETE_BATCH_SIZE) {
+            let condition = batch.iter().fold(Condition::any(), |condition, pending| {
+                condition.add(
+                    Condition::all()
+                        .add(receipt::Column::RelayId.eq(&pending.0))
+                        .add(receipt::Column::Destination.eq(&pending.1))
+                        .add(receipt::Column::Sequence.eq(pending.2)),
+                )
+            });
+            expired_pending_receipts += receipt::Entity::delete_many()
+                .filter(condition)
+                .exec(&transaction)
+                .await?
+                .rows_affected;
+        }
+        let expired_pending = pending_message::Entity::delete_many()
+            .filter(pending_message::Column::CreatedAt.lt(pending_cutoff))
+            .exec(&transaction)
+            .await?
+            .rows_affected;
+
+        // Pending and receipt timestamps are written together, and pending
+        // retention never exceeds receipt retention. Any receipt this old
+        // that remains after the deletion above therefore represents an
+        // already acknowledged message.
+        let expired_receipts = receipt::Entity::delete_many()
+            .filter(receipt::Column::CreatedAt.lt(receipt_cutoff))
+            .exec(&transaction)
+            .await?
+            .rows_affected;
+        transaction.commit().await?;
+
         Ok(CleanupStats {
-            expired_pending,
-            expired_receipts: expired_pending_receipts + expired_receipts,
+            expired_pending: usize::try_from(expired_pending)
+                .context("expired pending count is too large")?,
+            expired_receipts: usize::try_from(expired_pending_receipts + expired_receipts)
+                .context("expired receipt count is too large")?,
         })
     }
 }
@@ -361,20 +297,24 @@ pub(crate) struct CleanupStats {
     pub(crate) expired_receipts: usize,
 }
 
-fn ensure_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|existing| existing == column) {
-        connection.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))?;
+async fn initialize_schema(connection: &DatabaseConnection) -> Result<()> {
+    let schema = Schema::new(connection.get_database_backend());
+    for mut table in [
+        schema.create_table_from_entity(counter::Entity),
+        schema.create_table_from_entity(receipt::Entity),
+        schema.create_table_from_entity(pending_message::Entity),
+    ] {
+        table.if_not_exists();
+        connection.execute(&table).await?;
+    }
+
+    let indexes = schema
+        .create_index_from_entity(receipt::Entity)
+        .into_iter()
+        .chain(schema.create_index_from_entity(pending_message::Entity));
+    for mut index in indexes {
+        index.if_not_exists();
+        connection.execute(&index).await?;
     }
     Ok(())
 }
@@ -387,28 +327,16 @@ fn unix_timestamp() -> Result<i64> {
     i64::try_from(seconds).context("system clock is out of range")
 }
 
-fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
-    let payload: String = row.get(2)?;
-    let payload = serde_json::from_str(&payload).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            payload.len(),
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    })?;
-    let sequence = row.get::<_, i64>(1)?;
-    let sequence = u64::try_from(sequence).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Integer,
-            Box::new(error),
-        )
-    })?;
-    Ok(StoredMessage {
-        message_id: row.get(0)?,
-        sequence,
-        payload,
-    })
+impl TryFrom<pending_message::Model> for StoredMessage {
+    type Error = anyhow::Error;
+
+    fn try_from(model: pending_message::Model) -> Result<Self> {
+        Ok(Self {
+            message_id: model.message_id,
+            sequence: u64::try_from(model.sequence).context("stored sequence is negative")?,
+            payload: model.payload,
+        })
+    }
 }
 
 fn validate_message_id(message_id: &str) -> Result<()> {
@@ -420,178 +348,197 @@ fn validate_message_id(message_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::sea_query::Expr;
 
-    fn database() -> (tempfile::TempDir, Database) {
-        database_with_limits(Limits::default())
+    async fn database() -> (tempfile::TempDir, Database) {
+        database_with_limits(Limits::default()).await
     }
 
-    fn database_with_limits(limits: Limits) -> (tempfile::TempDir, Database) {
+    async fn database_with_limits(limits: Limits) -> (tempfile::TempDir, Database) {
         let directory = tempfile::tempdir().unwrap();
-        let database = Database::open(&directory.path().join("relay.sqlite3"), limits).unwrap();
+        let database = Database::open(&directory.path().join("relay.sqlite3"), limits)
+            .await
+            .unwrap();
         (directory, database)
     }
 
-    #[test]
-    fn stores_replays_and_acknowledges_messages() {
-        let (_directory, database) = database();
+    #[tokio::test]
+    async fn stores_replays_and_acknowledges_messages() {
+        let (_directory, database) = database().await;
         let payload = serde_json::json!({ "opaque": [1, 2, 3] });
         let stored = database
             .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .await
             .unwrap();
         assert_eq!(stored.pending.as_ref().unwrap().sequence, 1);
-        assert_eq!(database.pending("pair-a", Endpoint::Two).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .pending("pair-a", Endpoint::Two)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
-        database.acknowledge("pair-a", Endpoint::Two, 1).unwrap();
+        assert_eq!(
+            database
+                .acknowledge("pair-a", Endpoint::Two, 1)
+                .await
+                .unwrap(),
+            1
+        );
         assert!(
             database
                 .pending("pair-a", Endpoint::Two)
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
 
-    #[test]
-    fn duplicate_message_ids_are_idempotent_after_ack() {
-        let (_directory, database) = database();
+    #[tokio::test]
+    async fn duplicate_message_ids_are_idempotent_after_ack() {
+        let (_directory, database) = database().await;
         let payload = serde_json::json!({ "request": "once" });
         database
             .store("pair-a", Endpoint::Two, "endpoint2-1", &payload)
+            .await
             .unwrap();
-        database.acknowledge("pair-a", Endpoint::One, 1).unwrap();
+        database
+            .acknowledge("pair-a", Endpoint::One, 1)
+            .await
+            .unwrap();
 
         let duplicate = database
             .store("pair-a", Endpoint::Two, "endpoint2-1", &payload)
+            .await
             .unwrap();
         assert!(duplicate.pending.is_none());
         assert!(
             database
                 .pending("pair-a", Endpoint::One)
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
 
-    #[test]
-    fn relay_ids_and_directions_are_isolated() {
-        let (_directory, database) = database();
+    #[tokio::test]
+    async fn relay_ids_and_directions_are_isolated() {
+        let (_directory, database) = database().await;
         database
             .store("pair-a", Endpoint::One, "one", &serde_json::json!(1))
+            .await
             .unwrap();
         database
             .store("pair-b", Endpoint::Two, "one", &serde_json::json!(2))
+            .await
             .unwrap();
 
-        assert_eq!(database.pending("pair-a", Endpoint::Two).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .pending("pair-a", Endpoint::Two)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
             database
                 .pending("pair-a", Endpoint::One)
+                .await
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(database.pending("pair-b", Endpoint::One).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .pending("pair-b", Endpoint::One)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
             database
                 .pending("pair-b", Endpoint::Two)
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
 
-    #[test]
-    fn migrates_legacy_role_names_to_numbered_endpoints() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("relay.sqlite3");
-        let database = Database::open(&path, Limits::default()).unwrap();
-        database
-            .store(
-                "pair-a",
-                Endpoint::One,
-                "endpoint1-1",
-                &serde_json::json!(1),
-            )
-            .unwrap();
-        database
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "UPDATE counters SET destination = 'app' WHERE destination = '2';
-                 UPDATE receipts
-                 SET source = 'host', destination = 'app'
-                 WHERE source = '1' AND destination = '2';
-                 UPDATE pending_messages SET destination = 'app' WHERE destination = '2';",
-            )
-            .unwrap();
-        drop(database);
-
-        let database = Database::open(&path, Limits::default()).unwrap();
-        assert_eq!(database.pending("pair-a", Endpoint::Two).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn rejects_new_messages_when_a_direction_reaches_its_limits() {
+    #[tokio::test]
+    async fn rejects_new_messages_when_a_direction_reaches_its_limits() {
         let limits = Limits {
             max_pending_messages: 1,
             max_pending_bytes: 1024,
             ..Limits::default()
         };
-        let (_directory, database) = database_with_limits(limits);
+        let (_directory, database) = database_with_limits(limits).await;
         let payload = serde_json::json!({ "request": 1 });
         database
             .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .await
             .unwrap();
 
         let error = database
             .store("pair-a", Endpoint::One, "endpoint1-2", &payload)
+            .await
             .unwrap_err();
         assert!(error.to_string().starts_with("queue_full:"));
 
         // A retry remains idempotent even while the queue is full.
         database
             .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .await
             .unwrap();
 
         let oversized = serde_json::json!("x".repeat(1024));
         let error = database
             .store("pair-b", Endpoint::One, "endpoint1-1", &oversized)
+            .await
             .unwrap_err();
         assert!(error.to_string().contains("payload byte limit"));
     }
 
-    #[test]
-    fn expires_pending_messages_and_their_receipts_together() {
+    #[tokio::test]
+    async fn expires_pending_messages_and_their_receipts_together() {
         let limits = Limits {
             pending_retention_secs: 1,
             receipt_retention_secs: 1,
             ..Limits::default()
         };
-        let (_directory, database) = database_with_limits(limits);
+        let (_directory, database) = database_with_limits(limits).await;
         let payload = serde_json::json!({ "request": 1 });
         database
             .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .await
             .unwrap();
-        database
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "UPDATE pending_messages SET created_at = 1;
-                 UPDATE receipts SET created_at = 1;",
-            )
+        pending_message::Entity::update_many()
+            .col_expr(pending_message::Column::CreatedAt, Expr::value(1))
+            .exec(&database.connection)
+            .await
+            .unwrap();
+        receipt::Entity::update_many()
+            .col_expr(receipt::Column::CreatedAt, Expr::value(1))
+            .exec(&database.connection)
+            .await
             .unwrap();
 
-        let stats = database.cleanup().unwrap();
+        let stats = database.cleanup().await.unwrap();
         assert_eq!(stats.expired_pending, 1);
         assert_eq!(stats.expired_receipts, 1);
         assert!(
             database
                 .pending("pair-a", Endpoint::Two)
+                .await
                 .unwrap()
                 .is_empty()
         );
 
         let retried = database
             .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .await
             .unwrap();
         assert_eq!(retried.pending.unwrap().sequence, 2);
     }

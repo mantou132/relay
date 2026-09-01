@@ -18,6 +18,7 @@ variable:
 
 | Option | Environment variable | Default |
 | --- | --- | --- |
+| `--debug` | `RELAY_DEBUG` | enabled automatically in debug builds |
 | `--bind` | `RELAY_BIND` | `127.0.0.1:39371` |
 | `--database` | `RELAY_DATABASE` | `relay.sqlite3` |
 | `--max-pending-messages` | `RELAY_MAX_PENDING_MESSAGES` | `10000` per id and direction |
@@ -26,8 +27,29 @@ variable:
 | `--receipt-retention-secs` | `RELAY_RECEIPT_RETENTION_SECS` | `2592000` (30 days) |
 | `--cleanup-interval-secs` | `RELAY_CLEANUP_INTERVAL_SECS` | `3600` (1 hour) |
 
+Debug logging records connection and disconnection details, pairing ids,
+endpoints, message ids, JSON payloads, acknowledgements, and replay/forwarding
+outcomes. Because pairing ids are credentials and payloads may be sensitive, do
+not enable it in production unless the resulting logs are protected. Release
+builds can enable it with `--debug` or `RELAY_DEBUG=true`; `RUST_LOG` can be used
+to override the log filter.
+
 For an internet-facing deployment, terminate TLS in a reverse proxy and expose
 the WebSocket endpoint over `wss://`.
+
+## Docker
+
+The release workflow builds the `linux/amd64` image
+`594mantou/relay` and publishes it to Docker Hub when a GitHub Release is
+published. It can also be started manually from the Actions tab. Configure the
+repository secrets `DOCKER_USERNAME` and `DOCKER_PASSWORD` before running it.
+
+```sh
+docker run --rm \
+  -p 39371:39371 \
+  -v relay-data:/data \
+  594mantou/relay:main
+```
 
 ## Connect
 
@@ -43,7 +65,8 @@ Messages are isolated by pairing id and only forwarded to the opposite endpoint
 with the same id. The first connection for `(id, endpoint)` remains active; another
 connection for the same key receives a `connection_conflict` error and closes,
 without disconnecting the existing client. Either endpoint may connect first;
-messages wait in SQLite until its peer connects.
+messages wait in SQLite until its peer connects. The SQLite storage layer uses
+SeaORM entities, transactions, and schema builders rather than handwritten SQL.
 
 Clients should treat `connection_conflict` as terminal instead of immediately
 reconnecting. They may connect again after an operator resolves the duplicate
@@ -107,5 +130,5 @@ application execution. An application should make side effects idempotent when
 processing a delivered payload.
 
 Cleanup runs once at startup and periodically afterwards. It removes expired
-rows, truncates the SQLite WAL, and requests incremental vacuuming so freed pages
-can be returned to the filesystem where supported.
+rows; SQLite runs in WAL mode with full auto-vacuum so freed pages can be
+returned to the filesystem.

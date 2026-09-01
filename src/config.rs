@@ -12,8 +12,12 @@ const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
 #[derive(Debug, Parser)]
 #[command(name = "relay")]
 pub(crate) struct Args {
+    /// Emit connection and message details. Debug builds enable this automatically.
+    #[arg(long, env = "RELAY_DEBUG")]
+    debug: bool,
+
     /// Address on which the WebSocket relay listens.
-    #[arg(long, env = "RELAY_BIND", default_value = "127.0.0.1:39371")]
+    #[arg(long, env = "RELAY_BIND", default_value = "0.0.0.0:39371")]
     pub(crate) bind: SocketAddr,
 
     /// SQLite database containing pending messages and idempotency receipts.
@@ -59,6 +63,12 @@ pub(crate) struct Args {
         default_value_t = DEFAULT_CLEANUP_INTERVAL_SECS
     )]
     pub(crate) cleanup_interval_secs: u64,
+}
+
+impl Args {
+    pub(crate) fn debug_enabled(&self) -> bool {
+        self.debug || cfg!(debug_assertions)
+    }
 }
 
 #[derive(Clone, Copy)]
