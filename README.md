@@ -37,6 +37,20 @@ to override the log filter.
 For an internet-facing deployment, terminate TLS in a reverse proxy and expose
 the WebSocket endpoint over `wss://`.
 
+## Docker
+
+The release workflow builds the `linux/amd64` image
+`594mantou/relay` and publishes it to Docker Hub when a GitHub Release is
+published. It can also be started manually from the Actions tab. Configure the
+repository secrets `DOCKER_USERNAME` and `DOCKER_PASSWORD` before running it.
+
+```sh
+docker run --rm \
+  -p 39371:39371 \
+  -v relay-data:/data \
+  594mantou/relay:main
+```
+
 ## Connect
 
 Each channel has two numbered endpoints. Connect one client as endpoint 1 and
