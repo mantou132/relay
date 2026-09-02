@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 sea-orm = { version = "2.0.2", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-json"] }

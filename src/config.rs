@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -8,6 +8,12 @@ const DEFAULT_MAX_PENDING_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_PENDING_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_RECEIPT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// How often an established connection is pinged. A connection that sends
+/// nothing for `DEFAULT_IDLE_TIMEOUT_SECS` — three ping intervals — is
+/// treated as half-open and dropped.
+const PING_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Parser)]
 #[command(name = "relay")]
@@ -63,6 +69,15 @@ pub(crate) struct Args {
         default_value_t = DEFAULT_CLEANUP_INTERVAL_SECS
     )]
     pub(crate) cleanup_interval_secs: u64,
+
+    /// Seconds of inbound silence (no frames, pings, or pongs) before a
+    /// connection is considered half-open and closed.
+    #[arg(
+        long,
+        env = "RELAY_IDLE_TIMEOUT_SECS",
+        default_value_t = DEFAULT_IDLE_TIMEOUT_SECS
+    )]
+    pub(crate) idle_timeout_secs: u64,
 }
 
 impl Args {
@@ -77,6 +92,8 @@ pub(crate) struct Limits {
     pub(crate) max_pending_bytes: i64,
     pub(crate) pending_retention_secs: i64,
     pub(crate) receipt_retention_secs: i64,
+    pub(crate) ping_interval: Duration,
+    pub(crate) idle_timeout: Duration,
 }
 
 impl Limits {
@@ -102,6 +119,11 @@ impl Limits {
             "cleanup interval must be positive"
         );
         anyhow::ensure!(
+            args.idle_timeout_secs > PING_INTERVAL_SECS,
+            "idle timeout must exceed the {} second ping interval",
+            PING_INTERVAL_SECS
+        );
+        anyhow::ensure!(
             args.receipt_retention_secs >= args.pending_retention_secs,
             "receipt retention must be at least as long as pending retention"
         );
@@ -114,6 +136,8 @@ impl Limits {
                 .context("pending retention is too large")?,
             receipt_retention_secs: i64::try_from(args.receipt_retention_secs)
                 .context("receipt retention is too large")?,
+            ping_interval: Duration::from_secs(PING_INTERVAL_SECS),
+            idle_timeout: Duration::from_secs(args.idle_timeout_secs),
         })
     }
 }
@@ -125,6 +149,8 @@ impl Default for Limits {
             max_pending_bytes: DEFAULT_MAX_PENDING_BYTES as i64,
             pending_retention_secs: DEFAULT_PENDING_RETENTION_SECS as i64,
             receipt_retention_secs: DEFAULT_RECEIPT_RETENTION_SECS as i64,
+            ping_interval: Duration::from_secs(PING_INTERVAL_SECS),
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         }
     }
 }

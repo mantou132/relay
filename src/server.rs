@@ -11,11 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use relay::{ClientFrame, Endpoint, ServerFrame};
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{Instrument, debug, error, info};
+use tokio::time::{self, Instant};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     config::{Args, Limits},
@@ -30,6 +32,7 @@ const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 struct AppState {
     database: Arc<Database>,
     hub: Arc<Hub>,
+    limits: Limits,
     /// Prevents a message from landing between reconnect replay and hub registration.
     delivery: Arc<Mutex<()>>,
 }
@@ -88,6 +91,11 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 Ok(pending) => pending,
                 Err(error) => {
                     error!(%error, "failed to read pending relay messages");
+                    reject_socket(
+                        &mut socket,
+                        "relay_storage_unavailable: pending messages could not be read",
+                    )
+                    .await;
                     return;
                 }
             };
@@ -101,44 +109,79 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
 
     let Some((token, replayed)) = registration else {
         debug!("WebSocket connection rejected: endpoint already connected");
-        let conflict = ServerFrame::Error {
-            message: "connection_conflict: this id and endpoint already has an active connection"
-                .to_string(),
-        };
-        if let Ok(json) = serde_json::to_string(&conflict) {
-            let _ = socket.send(Message::Text(json.into())).await;
-        }
-        let _ = socket.send(Message::Close(None)).await;
+        reject_socket(
+            &mut socket,
+            "connection_conflict: this id and endpoint already has an active connection",
+        )
+        .await;
         return;
     };
     debug!(replayed_messages = replayed, "WebSocket endpoint connected");
 
     let (mut sink, mut stream) = socket.split();
+    let ping_interval = state.limits.ping_interval;
+    let idle_timeout = state.limits.idle_timeout;
     let writer = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            let Ok(json) = serde_json::to_string(&frame) else {
-                continue;
-            };
-            if sink.send(Message::Text(json.into())).await.is_err() {
-                break;
+        // The server pings so that a half-open peer is detected even when no
+        // application traffic is flowing: writes to a dead socket eventually
+        // fail, and the read loop drops the connection once pongs stop.
+        let mut ping = time::interval(ping_interval);
+        ping.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        ping.reset();
+        loop {
+            tokio::select! {
+                frame = rx.recv() => {
+                    let Some(frame) = frame else {
+                        break;
+                    };
+                    let Ok(json) = serde_json::to_string(&frame) else {
+                        continue;
+                    };
+                    if sink.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(Bytes::from_static(b"relay"))).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    while let Some(result) = stream.next().await {
-        if !state.hub.is_current(&query.id, query.endpoint, token) {
-            break;
-        }
+    // Any inbound frame counts as proof of life; pongs arrive only while the
+    // peer's TCP path is intact, so a silent connection is dropped here.
+    let mut last_activity = Instant::now();
+    loop {
+        let result = time::timeout(idle_timeout, stream.next()).await;
         let message = match result {
-            Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => break,
-            Err(error) => {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(error))) => {
                 debug!(%error, "WebSocket read failed");
                 break;
             }
-            Ok(_) => continue,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                let silent_for = last_activity.elapsed();
+                warn!(
+                    ?silent_for,
+                    "WebSocket endpoint went silent; dropping half-open connection"
+                );
+                break;
+            }
         };
-        let frame = match serde_json::from_str::<ClientFrame>(&message) {
+        last_activity = Instant::now();
+        if !state.hub.is_current(&query.id, query.endpoint, token) {
+            break;
+        }
+        let text = match message {
+            Message::Text(text) => text,
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Binary(_) => continue,
+        };
+        let frame = match serde_json::from_str::<ClientFrame>(&text) {
             Ok(frame) => frame,
             Err(error) => {
                 debug!(%error, "client sent an invalid frame");
@@ -204,6 +247,19 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
     debug!("WebSocket endpoint disconnected");
 }
 
+/// Sends a terminal error frame and closes the socket, used when a connection
+/// cannot be served. The close frame still reaches the client while the
+/// underlying connection is healthy.
+async fn reject_socket(socket: &mut WebSocket, message: &str) {
+    let error = ServerFrame::Error {
+        message: message.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string(&error) {
+        let _ = socket.send(Message::Text(json.into())).await;
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
 pub(crate) async fn run(args: Args) -> Result<()> {
     let limits = Limits::from_args(&args)?;
     let database = Arc::new(Database::open(&args.database, limits).await?);
@@ -216,6 +272,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let state = AppState {
         database,
         hub: Arc::default(),
+        limits,
         delivery: Arc::default(),
     };
     let router = Router::new()

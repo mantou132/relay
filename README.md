@@ -76,6 +76,18 @@ The pairing id is the channel's access credential. Generate it with sufficient
 entropy, keep it secret, and avoid recording WebSocket query strings in proxy
 access logs.
 
+## Single instance
+
+One channel's database must be served by exactly one relay process. Connection
+state (which `(id, endpoint)` slots are occupied) lives in process memory, so
+two relay processes sharing one SQLite file would each accept a connection for
+the same `(id, endpoint)`, break duplicate detection, and deliver messages to
+whichever process the client happened to reach. Run one process per SQLite
+file and scale by sharding pairing ids across files, behind a load balancer
+that routes all WebSockets for a pairing id to the same instance (for example
+by consistent hashing on the `id` query parameter). After a failover, wait for
+the old process to exit before starting the replacement on the same file.
+
 ## Wire protocol
 
 Client to server:
@@ -124,6 +136,13 @@ Pending messages older than the configured retention period are removed along
 with their receipts. A later retry of the same `message_id` is therefore treated
 as a new delivery with a new sequence. Acknowledged receipts expire separately
 after the longer receipt-retention period.
+
+The relay detects dead connections itself: it pings every 30 seconds and closes
+a connection that has sent nothing (no frames, pongs, or pings) for 90 seconds.
+This releases the `(id, endpoint)` slot of a half-open peer — one whose network
+path died without a TCP close, for example after a network switch or sleep — so
+the real client can reconnect. Clients should also send their own protocol-level
+pings if they need to detect a dead relay faster than their TCP stack does.
 
 The relay deliberately provides at-least-once transport, not exactly-once
 application execution. An application should make side effects idempotent when
