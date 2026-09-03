@@ -1,0 +1,15 @@
+{
+  "name": "relay-client-ts",
+  "version": "0.1.0",
+  "description": "Reliable WebSocket client for the durable relay server",
+  "type": "module",
+  "main": "src/relay-client.ts",
+  "types": "src/relay-client.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src"
+  ],
+  "license": "MIT"
+}

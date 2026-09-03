@@ -21,6 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = "3"
 tokio-tungstenite = "0.29"
+relay-client = { path = "client-rs" }
+async-trait = "0.1"
 
 [[bin]]
 name = "relay"
