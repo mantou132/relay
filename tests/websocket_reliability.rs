@@ -78,8 +78,8 @@ impl Drop for RelayServer {
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn connect(port: u16, id: &str, endpoint: Endpoint) -> Socket {
-    let url = format!("ws://127.0.0.1:{port}/ws?id={id}&endpoint={endpoint}");
+async fn connect(port: u16, id: &str, endpoint: Endpoint, device_id: &str) -> Socket {
+    let url = format!("ws://127.0.0.1:{port}/ws?id={id}&endpoint={endpoint}&device_id={device_id}");
     for _ in 0..100 {
         match connect_async(&url).await {
             Ok((socket, _)) => return socket,
@@ -120,21 +120,12 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
         .port();
     let server = RelayServer::spawn(port, &database);
 
-    let mut endpoint_one = connect(port, "pair-a", Endpoint::One).await;
+    let mut endpoint_one = connect(port, "pair-a", Endpoint::One, "dev-1").await;
     expect_ready(&mut endpoint_one, Endpoint::One).await;
-    let mut duplicate_endpoint_one = connect(port, "pair-a", Endpoint::One).await;
-    assert_eq!(
-        receive(&mut duplicate_endpoint_one).await,
-        ServerFrame::Error {
-            message: "connection_conflict: this id and endpoint already has an active connection"
-                .to_string(),
-        }
-    );
-    assert!(matches!(
-        duplicate_endpoint_one.next().await,
-        Some(Ok(Message::Close(_))) | None
-    ));
-    let mut unrelated_endpoint_two = connect(port, "pair-b", Endpoint::Two).await;
+    let mut another_endpoint_one = connect(port, "pair-a", Endpoint::One, "dev-2").await;
+    expect_ready(&mut another_endpoint_one, Endpoint::One).await;
+
+    let mut unrelated_endpoint_two = connect(port, "pair-b", Endpoint::Two, "dev-1").await;
     expect_ready(&mut unrelated_endpoint_two, Endpoint::Two).await;
 
     send(
@@ -152,7 +143,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             message_id: "endpoint_one-1".to_string()
         }
     );
-    let mut unrelated_endpoint_one = connect(port, "pair-b", Endpoint::One).await;
+    let mut unrelated_endpoint_one = connect(port, "pair-b", Endpoint::One, "dev-1").await;
     expect_ready(&mut unrelated_endpoint_one, Endpoint::One).await;
     send(
         &mut unrelated_endpoint_one,
@@ -179,7 +170,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
         "pair-b received a message belonging to another relay id"
     );
 
-    let mut endpoint_two = connect(port, "pair-a", Endpoint::Two).await;
+    let mut endpoint_two = connect(port, "pair-a", Endpoint::Two, "dev-1").await;
     expect_ready(&mut endpoint_two, Endpoint::Two).await;
     assert_eq!(
         receive(&mut endpoint_two).await,
@@ -214,7 +205,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
     server.stop();
 
     let _restarted_server = RelayServer::spawn(port, &database);
-    let mut reconnected_endpoint_two = connect(port, "pair-a", Endpoint::Two).await;
+    let mut reconnected_endpoint_two = connect(port, "pair-a", Endpoint::Two, "dev-1").await;
     expect_ready(&mut reconnected_endpoint_two, Endpoint::Two).await;
     assert_eq!(
         receive(&mut reconnected_endpoint_two).await,
@@ -237,7 +228,7 @@ async fn debug_logs_connections_messages_and_disconnects() {
         .port();
     let server = RelayServer::spawn_with_debug_logs(port, &database);
 
-    let mut socket = connect(port, "logged-pair", Endpoint::One).await;
+    let mut socket = connect(port, "logged-pair", Endpoint::One, "dev-1").await;
     expect_ready(&mut socket, Endpoint::One).await;
     send(
         &mut socket,

@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::{
     config::Limits,
-    entity::{counter, pending_message, receipt},
+    entity::{counter, device, pending_message, receipt},
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -199,6 +199,44 @@ impl Database {
         Ok(StoreResult { pending })
     }
 
+    pub(crate) async fn register_device(
+        &self,
+        relay_id: &str,
+        endpoint: Endpoint,
+        device_id: &str,
+    ) -> Result<i64> {
+        let now = unix_timestamp()?;
+        let transaction = self.connection.begin().await?;
+        let existing = device::Entity::find_by_id((
+            relay_id.to_owned(),
+            endpoint.to_string(),
+            device_id.to_owned(),
+        ))
+        .one(&transaction)
+        .await?;
+
+        let last_acked = if let Some(dev) = existing {
+            let mut active = dev.clone().into_active_model();
+            active.last_seen_at = Set(now);
+            active.update(&transaction).await?;
+            dev.last_acked_sequence
+        } else {
+            device::ActiveModel {
+                relay_id: Set(relay_id.to_owned()),
+                endpoint: Set(endpoint.to_string()),
+                device_id: Set(device_id.to_owned()),
+                last_acked_sequence: Set(0),
+                last_seen_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+            0
+        };
+        transaction.commit().await?;
+        Ok(last_acked)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn pending(
         &self,
         relay_id: &str,
@@ -215,19 +253,94 @@ impl Database {
             .collect()
     }
 
+    pub(crate) async fn pending_for_device(
+        &self,
+        relay_id: &str,
+        destination: Endpoint,
+        device_id: &str,
+    ) -> Result<Vec<StoredMessage>> {
+        let dev = device::Entity::find_by_id((
+            relay_id.to_owned(),
+            destination.to_string(),
+            device_id.to_owned(),
+        ))
+        .one(&self.connection)
+        .await?;
+
+        let last_acked = dev.map_or(0, |d| d.last_acked_sequence);
+
+        pending_message::Entity::find()
+            .filter(pending_message::Column::RelayId.eq(relay_id))
+            .filter(pending_message::Column::Destination.eq(destination.to_string()))
+            .filter(pending_message::Column::Sequence.gt(last_acked))
+            .order_by_asc(pending_message::Column::Sequence)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(StoredMessage::try_from)
+            .collect()
+    }
+
     pub(crate) async fn acknowledge(
         &self,
         relay_id: &str,
         destination: Endpoint,
+        device_id: &str,
         sequence: u64,
     ) -> Result<u64> {
         let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
+        let now = unix_timestamp()?;
+        let transaction = self.connection.begin().await?;
+
+        let dev = device::Entity::find_by_id((
+            relay_id.to_owned(),
+            destination.to_string(),
+            device_id.to_owned(),
+        ))
+        .one(&transaction)
+        .await?;
+
+        if let Some(dev) = dev {
+            if sequence > dev.last_acked_sequence {
+                let mut active = dev.into_active_model();
+                active.last_acked_sequence = Set(sequence);
+                active.last_seen_at = Set(now);
+                active.update(&transaction).await?;
+            }
+        } else {
+            device::ActiveModel {
+                relay_id: Set(relay_id.to_owned()),
+                endpoint: Set(destination.to_string()),
+                device_id: Set(device_id.to_owned()),
+                last_acked_sequence: Set(sequence),
+                last_seen_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        // Find the minimum acknowledged sequence across all devices registered
+        // for this (relay_id, destination).
+        let all_devices = device::Entity::find()
+            .filter(device::Column::RelayId.eq(relay_id))
+            .filter(device::Column::Endpoint.eq(destination.to_string()))
+            .all(&transaction)
+            .await?;
+
+        let min_acked = all_devices
+            .iter()
+            .map(|d| d.last_acked_sequence)
+            .min()
+            .unwrap_or(sequence);
+
         let result = pending_message::Entity::delete_many()
             .filter(pending_message::Column::RelayId.eq(relay_id))
             .filter(pending_message::Column::Destination.eq(destination.to_string()))
-            .filter(pending_message::Column::Sequence.lte(sequence))
-            .exec(&self.connection)
+            .filter(pending_message::Column::Sequence.lte(min_acked))
+            .exec(&transaction)
             .await?;
+
+        transaction.commit().await?;
         Ok(result.rows_affected)
     }
 
@@ -280,6 +393,14 @@ impl Database {
             .exec(&transaction)
             .await?
             .rows_affected;
+        // Expire stale devices that have not been seen for receipt_retention_secs,
+        // ensuring abandoned devices do not permanently block queue pruning.
+        let _expired_devices = device::Entity::delete_many()
+            .filter(device::Column::LastSeenAt.lt(receipt_cutoff))
+            .exec(&transaction)
+            .await?
+            .rows_affected;
+
         transaction.commit().await?;
 
         Ok(CleanupStats {
@@ -303,6 +424,7 @@ async fn initialize_schema(connection: &DatabaseConnection) -> Result<()> {
         schema.create_table_from_entity(counter::Entity),
         schema.create_table_from_entity(receipt::Entity),
         schema.create_table_from_entity(pending_message::Entity),
+        schema.create_table_from_entity(device::Entity),
     ] {
         table.if_not_exists();
         connection.execute(&table).await?;
@@ -311,7 +433,8 @@ async fn initialize_schema(connection: &DatabaseConnection) -> Result<()> {
     let indexes = schema
         .create_index_from_entity(receipt::Entity)
         .into_iter()
-        .chain(schema.create_index_from_entity(pending_message::Entity));
+        .chain(schema.create_index_from_entity(pending_message::Entity))
+        .chain(schema.create_index_from_entity(device::Entity));
     for mut index in indexes {
         index.if_not_exists();
         connection.execute(&index).await?;
@@ -382,7 +505,7 @@ mod tests {
 
         assert_eq!(
             database
-                .acknowledge("pair-a", Endpoint::Two, 1)
+                .acknowledge("pair-a", Endpoint::Two, "default", 1)
                 .await
                 .unwrap(),
             1
@@ -405,7 +528,7 @@ mod tests {
             .await
             .unwrap();
         database
-            .acknowledge("pair-a", Endpoint::One, 1)
+            .acknowledge("pair-a", Endpoint::One, "default", 1)
             .await
             .unwrap();
 
@@ -541,5 +664,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retried.pending.unwrap().sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn multi_device_independent_cursors_and_purging() {
+        let (_directory, database) = database().await;
+
+        // Register two devices for Endpoint::Two
+        let phone_a_acked = database
+            .register_device("pair-m", Endpoint::Two, "phone_a")
+            .await
+            .unwrap();
+        assert_eq!(phone_a_acked, 0);
+
+        let phone_b_acked = database
+            .register_device("pair-m", Endpoint::Two, "phone_b")
+            .await
+            .unwrap();
+        assert_eq!(phone_b_acked, 0);
+
+        // Store 3 messages destined for Endpoint::Two
+        database
+            .store("pair-m", Endpoint::One, "msg-1", &serde_json::json!("first"))
+            .await
+            .unwrap();
+        database
+            .store("pair-m", Endpoint::One, "msg-2", &serde_json::json!("second"))
+            .await
+            .unwrap();
+        database
+            .store("pair-m", Endpoint::One, "msg-3", &serde_json::json!("third"))
+            .await
+            .unwrap();
+
+        // Both devices should see all 3 pending messages initially
+        let pending_a = database
+            .pending_for_device("pair-m", Endpoint::Two, "phone_a")
+            .await
+            .unwrap();
+        assert_eq!(pending_a.len(), 3);
+        let pending_b = database
+            .pending_for_device("pair-m", Endpoint::Two, "phone_b")
+            .await
+            .unwrap();
+        assert_eq!(pending_b.len(), 3);
+
+        // phone_a acks up to sequence 2
+        let deleted = database
+            .acknowledge("pair-m", Endpoint::Two, "phone_a", 2)
+            .await
+            .unwrap();
+        // Since phone_b is still at 0, min_acked is 0, so 0 messages deleted from DB
+        assert_eq!(deleted, 0);
+
+        // phone_a now only has sequence 3 pending
+        let pending_a = database
+            .pending_for_device("pair-m", Endpoint::Two, "phone_a")
+            .await
+            .unwrap();
+        assert_eq!(pending_a.len(), 1);
+        assert_eq!(pending_a[0].sequence, 3);
+
+        // phone_b STILL has all 3 messages pending!
+        let pending_b = database
+            .pending_for_device("pair-m", Endpoint::Two, "phone_b")
+            .await
+            .unwrap();
+        assert_eq!(pending_b.len(), 3);
+
+        // phone_b now acks up to sequence 2
+        let deleted = database
+            .acknowledge("pair-m", Endpoint::Two, "phone_b", 2)
+            .await
+            .unwrap();
+        // Now BOTH devices have acked up to sequence 2, so sequences 1 and 2 are deleted!
+        assert_eq!(deleted, 2);
+
+        // Now both devices only have sequence 3 pending
+        assert_eq!(
+            database
+                .pending_for_device("pair-m", Endpoint::Two, "phone_a")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .pending_for_device("pair-m", Endpoint::Two, "phone_b")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // phone_b acks sequence 3
+        database
+            .acknowledge("pair-m", Endpoint::Two, "phone_b", 3)
+            .await
+            .unwrap();
+        // phone_a acks sequence 3
+        let deleted = database
+            .acknowledge("pair-m", Endpoint::Two, "phone_a", 3)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        // Database pending_messages is now completely empty
+        assert!(
+            database
+                .pending("pair-m", Endpoint::Two)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

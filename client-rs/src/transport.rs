@@ -19,9 +19,17 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(25);
 
 type Socket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Builds the connect URL with pairing id and endpoint query parameters.
-pub fn endpoint_url(relay_url: &str, relay_id: &str, endpoint: Endpoint) -> String {
-    format!("{relay_url}?id={relay_id}&endpoint={}", endpoint.as_str())
+/// Builds the connect URL with pairing id, endpoint, and device id query parameters.
+pub fn endpoint_url(
+    relay_url: &str,
+    relay_id: &str,
+    endpoint: Endpoint,
+    device_id: &str,
+) -> String {
+    format!(
+        "{relay_url}?id={relay_id}&endpoint={}&device_id={device_id}",
+        endpoint.as_str()
+    )
 }
 
 pub async fn connect(url: &str) -> Result<Transport> {
@@ -115,8 +123,8 @@ mod tests {
     #[test]
     fn endpoint_url_appends_query() {
         assert_eq!(
-            endpoint_url("ws://127.0.0.1:39371/ws", "abc", Endpoint::One),
-            "ws://127.0.0.1:39371/ws?id=abc&endpoint=1"
+            endpoint_url("ws://127.0.0.1:39371/ws", "abc", Endpoint::One, "phone-1"),
+            "ws://127.0.0.1:39371/ws?id=abc&endpoint=1&device_id=phone-1"
         );
     }
 }

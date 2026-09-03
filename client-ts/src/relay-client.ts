@@ -3,8 +3,8 @@
  *
  * Implements the client side of the relay's at-least-once delivery contract:
  * a persistent outbox retried until `stored`, a cumulative receive cursor
- * with duplicate suppression, exponential-backoff reconnection, and terminal
- * (retryable) `connection_conflict` handling.
+ * with duplicate suppression, exponential-backoff reconnection, session preemption
+ * handling, and multi-device support.
  *
  * Storage is injectable so non-browser hosts can persist the outbox; the
  * default uses localStorage. The browser WebSocket answers the relay's
@@ -17,7 +17,7 @@ export type RelayConnectionState =
   | 'connecting'
   | 'connected'
   | 'reconnecting'
-  | 'conflict';
+  | 'preempted';
 
 export type OutboundMessage = {
   messageId: string;
@@ -45,13 +45,15 @@ export type RelayStore = {
   lastReceived: () => number | undefined | Promise<number | undefined>;
   /** Records a processed sequence after the payload was dispatched. */
   markReceived: (sequence: number) => void | Promise<void>;
-  /** Allocates the next unique message id, or undefined to use the default generator. */
-  nextMessageId?: () => string | undefined;
+  /** Returns the persistent device identifier if stored. */
+  deviceId?: () => string | undefined | Promise<string | undefined>;
 };
 
 export type RelayClientOptions = {
   relayId: string;
   endpoint: '1' | '2';
+  /** Optional stable device ID for multi-device support. Defaults to an auto-persisted UUID. */
+  deviceId?: string;
   /** WebSocket endpoint of the relay, e.g. wss://host/ws. */
   relayUrl: string;
   onPayload: (payload: unknown) => void | Promise<void>;
@@ -61,12 +63,6 @@ export type RelayClientOptions = {
   storageKey?: string;
   /** Defaults to a localStorage-backed store. */
   store?: RelayStore;
-  /**
-   * What to do on `connection_conflict`. `retry` keeps backing off
-   * because the relay drops silent connections, releasing the slot; `terminal` (default)
-   * stops after the conflict.
-   */
-  conflictPolicy?: 'retry' | 'terminal';
 };
 
 const MIN_RECONNECT_DELAY = 1_000;
@@ -76,14 +72,17 @@ export const isRelayId = (value: string) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 
 /**
- * Sequence gate shared with the Rust client: adopt the first observed
- * sequence, drop duplicates, and treat gaps as protocol errors.
+ * Sequence gate: adopt the first observed sequence, drop duplicates,
+ * and self-heal when a gap is detected (e.g. after multi-device consumption or retention purge).
  */
 export const isNewSequence = (lastReceived: number | undefined, sequence: number): boolean => {
   if (lastReceived === undefined) return true;
   if (sequence <= lastReceived) return false;
   if (sequence !== lastReceived + 1) {
-    throw new Error(`Relay 消息序列不连续：预期 ${lastReceived + 1}，收到 ${sequence}`);
+    console.warn(
+      `[RelayClient] 序列号跳跃：预期 ${lastReceived + 1}，收到 ${sequence}。自动同步接收游标。`,
+    );
+    return true;
   }
   return true;
 };
@@ -94,8 +93,7 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
   const key = storageKey;
   type StoredState = {
     relayId: string;
-    prefix: string;
-    nextMessage: number;
+    deviceId: string;
     lastReceived?: number;
     outbox: OutboundMessage[];
   };
@@ -107,14 +105,11 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
       if (
         value &&
         value.relayId === relayId &&
-        typeof value.prefix === 'string' &&
-        Number.isSafeInteger(value.nextMessage) &&
         Array.isArray(value.outbox)
       ) {
         return {
           relayId,
-          prefix: value.prefix,
-          nextMessage: value.nextMessage,
+          deviceId: typeof value.deviceId === 'string' && value.deviceId.length > 0 ? value.deviceId : crypto.randomUUID(),
           ...(Number.isSafeInteger(value.lastReceived) ? { lastReceived: value.lastReceived } : {}),
           outbox: value.outbox.filter(
             (item: any): item is OutboundMessage =>
@@ -126,14 +121,18 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
       // Corrupt or outdated state is replaced with a fresh outbox; the pairing id is
       // untouched so the user can still reconnect from settings.
     }
-    return { relayId, prefix: crypto.randomUUID(), nextMessage: 0, outbox: [] };
+    return {
+      relayId,
+      deviceId: crypto.randomUUID(),
+      outbox: [],
+    };
   };
   const save = (state: StoredState) => localStorage.setItem(key, JSON.stringify(state));
   return {
     outbox: () => load().outbox,
     enqueue: (message) => {
       const state = load();
-      save({ ...state, nextMessage: state.nextMessage + 1, outbox: [...state.outbox, message] });
+      save({ ...state, outbox: [...state.outbox, message] });
     },
     removeFromOutbox: (messageId) => {
       const state = load();
@@ -144,15 +143,19 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
       const state = load();
       save({ ...state, lastReceived: sequence });
     },
+    deviceId: () => {
+      const state = load();
+      return state.deviceId;
+    },
   };
 };
 
 export class RelayClient {
   readonly relayId: string;
   readonly #endpoint: '1' | '2';
+  #deviceId?: string;
   readonly #relayUrl: string;
   readonly #store: RelayStore;
-  readonly #conflictPolicy: 'retry' | 'terminal';
   #onPayload: RelayClientOptions['onPayload'];
   #onStateChange?: RelayClientOptions['onStateChange'];
   #onDisconnect?: RelayClientOptions['onDisconnect'];
@@ -160,7 +163,7 @@ export class RelayClient {
   #sent = new Set<string>();
   #relayReady = false;
   #manualClose = false;
-  #conflictSeen = false;
+  #preemptedSeen = false;
   #reconnectDelay = MIN_RECONNECT_DELAY;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
   #receiveChain = Promise.resolve();
@@ -168,35 +171,42 @@ export class RelayClient {
   constructor({
     relayId,
     endpoint,
+    deviceId,
     relayUrl,
     onPayload,
     onStateChange,
     onDisconnect,
     storageKey,
     store,
-    conflictPolicy = 'terminal',
   }: RelayClientOptions) {
     if (!isRelayId(relayId)) throw new Error('Relay ID 必须是 UUID');
     this.relayId = relayId;
     this.#endpoint = endpoint;
+    this.#deviceId = deviceId;
     this.#relayUrl = relayUrl;
     this.#store = store ?? localStorageStore(relayId, storageKey);
-    this.#conflictPolicy = conflictPolicy;
     this.#onPayload = onPayload;
     this.#onStateChange = onStateChange;
     this.#onDisconnect = onDisconnect;
   }
 
-  connect = () => {
+  connect = async () => {
     if (this.#socket && this.#socket.readyState <= WebSocket.OPEN) return;
     this.#manualClose = false;
-    this.#conflictSeen = false;
+    this.#preemptedSeen = false;
     clearTimeout(this.#reconnectTimer);
     this.#emitState('connecting');
+
+    if (!this.#deviceId && this.#store.deviceId) {
+      this.#deviceId = await this.#store.deviceId();
+    }
 
     const url = new URL(this.#relayUrl);
     url.searchParams.set('id', this.relayId);
     url.searchParams.set('endpoint', this.#endpoint);
+    if (this.#deviceId) {
+      url.searchParams.set('device_id', this.#deviceId);
+    }
     const socket = new WebSocket(url);
     this.#socket = socket;
     socket.addEventListener('open', this.#handleOpen);
@@ -241,8 +251,8 @@ export class RelayClient {
       this.#emitState('disconnected');
       return;
     }
-    if (this.#conflictSeen && this.#conflictPolicy === 'terminal') {
-      this.#emitState('conflict', '此 Relay ID 已在其他客户端上连接');
+    if (this.#preemptedSeen) {
+      this.#emitState('preempted', '连接已被同设备的新会话取代');
       return;
     }
     this.#emitState('reconnecting');
@@ -279,8 +289,8 @@ export class RelayClient {
         return;
       }
       case 'error':
-        if (frame.message.startsWith('connection_conflict:')) {
-          this.#conflictSeen = true;
+        if (frame.message.startsWith('connection_replaced:')) {
+          this.#preemptedSeen = true;
           this.#socket?.close();
           return;
         }

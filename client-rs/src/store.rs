@@ -5,7 +5,7 @@
 //! cursor before acknowledging. Both sides therefore need durable state; this
 //! trait lets each host provide it (SQLite, localStorage, files, memory...).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -14,8 +14,7 @@ use crate::OutboundMessage;
 #[async_trait]
 pub trait OutboxStore: Send + Sync + 'static {
     /// Persists a new outbound message and returns its generated id. Ids must
-    /// be unique across process restarts (a timestamp/pid prefix plus a
-    /// counter works well).
+    /// be unique across process restarts (UUID v4 works well).
     async fn enqueue(&self, payload: Value) -> Result<String>;
 
     /// Returns all messages that have not yet been confirmed `stored`.
@@ -36,23 +35,26 @@ pub trait OutboxStore: Send + Sync + 'static {
 
 /// Sequence gate shared by all clients: the first observed sequence is
 /// adopted as the baseline (the relay's counter outlives this client's
-/// cursor), duplicates are dropped, and gaps indicate a relay bug or a
-/// tampered cursor, so they are hard errors.
-pub fn is_new_sequence(last_received: Option<u64>, sequence: u64) -> Result<bool> {
+/// cursor), duplicates are dropped, and when a sequence gap occurs
+/// (e.g. after retention purge or multi-device consumption), it logs a warning
+/// and self-heals by adopting the received sequence.
+pub fn is_new_sequence(last_received: Option<u64>, sequence: u64) -> bool {
     let Some(last_received) = last_received else {
-        return Ok(true);
+        return true;
     };
     if sequence <= last_received {
-        return Ok(false);
+        return false;
     }
-    let expected = last_received
-        .checked_add(1)
-        .context("relay receive sequence space exhausted")?;
-    anyhow::ensure!(
-        sequence == expected,
-        "relay message sequence gap: expected {expected}, received {sequence}"
-    );
-    Ok(true)
+    let expected = last_received.saturating_add(1);
+    if sequence != expected {
+        tracing::warn!(
+            last_received,
+            sequence,
+            expected,
+            "relay message sequence gap; self-healing cursor to received sequence"
+        );
+    }
+    true
 }
 
 #[cfg(test)]
@@ -60,10 +62,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adopts_first_sequence_then_requires_contiguity() {
-        assert!(is_new_sequence(None, 42).unwrap());
-        assert!(is_new_sequence(Some(42), 43).unwrap());
-        assert!(!is_new_sequence(Some(42), 42).unwrap());
-        assert!(is_new_sequence(Some(42), 44).is_err());
+    fn adopts_first_sequence_drops_duplicates_and_self_heals_gaps() {
+        assert!(is_new_sequence(None, 42));
+        assert!(is_new_sequence(Some(42), 43));
+        assert!(!is_new_sequence(Some(42), 42));
+        assert!(!is_new_sequence(Some(42), 41));
+        assert!(is_new_sequence(Some(42), 44));
     }
 }

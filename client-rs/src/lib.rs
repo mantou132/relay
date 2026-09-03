@@ -3,7 +3,7 @@
 //! The client owns the parts of the delivery contract the server cannot: an
 //! outbox that retries until the relay returns `stored`, a cumulative receive
 //! cursor with duplicate suppression, reconnection with exponential backoff,
-//! and `connection_conflict` handling.
+//! and session preemption handling.
 //!
 //! Transports and storage are injected:
 //!
@@ -20,7 +20,7 @@ pub mod transport;
 
 pub use relay_frame::{ClientFrame, Endpoint, ServerFrame};
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
 use store::OutboxStore;
@@ -37,39 +37,22 @@ pub struct OutboundMessage {
     pub payload: Value,
 }
 
-/// What happens after the relay reports this `(id, endpoint)` is in use.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ConflictPolicy {
-    /// Stop reconnecting; another client owns the slot.
-    Terminal,
-    /// Keep retrying with backoff. Correct once the relay drops silent
-    /// (half-open) connections, which releases the slot automatically.
-    Retry,
-}
-
 /// Callbacks invoked as the connection progresses.
 pub trait ClientHandler: Send + Sync + 'static {
     /// Called for each accepted, in-order payload, before the ack is sent.
     fn on_payload(&self, payload: Value);
     /// Called when the relay accepts the connection.
     fn on_connected(&self) {}
-    /// Called after every disconnect, including terminal ones.
+    /// Called after every disconnect.
     fn on_disconnected(&self, _error: Option<String>) {}
-    /// Called when a `connection_conflict` frame arrives.
-    fn on_conflict(&self) {}
-}
-
-/// Outcome of one connect cycle; drives the outer backoff loop.
-enum CycleOutcome {
-    Reconnect,
-    Conflict,
+    /// Called when another connection with the same device_id preempts this connection.
+    fn on_preempted(&self) {}
 }
 
 pub struct Client<S, H> {
     url: Arc<String>,
     store: Arc<S>,
     handler: Arc<H>,
-    conflict_policy: ConflictPolicy,
     notify_send: Arc<tokio::sync::Notify>,
 }
 
@@ -79,7 +62,6 @@ impl<S, H> Clone for Client<S, H> {
             url: self.url.clone(),
             store: self.store.clone(),
             handler: self.handler.clone(),
-            conflict_policy: self.conflict_policy,
             notify_send: self.notify_send.clone(),
         }
     }
@@ -94,13 +76,11 @@ where
         url: String,
         store: Arc<S>,
         handler: Arc<H>,
-        conflict_policy: ConflictPolicy,
     ) -> Self {
         Self {
             url: Arc::new(url),
             store,
             handler,
-            conflict_policy,
             notify_send: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -121,13 +101,13 @@ where
 
     /// Consuming variant of [`Client::run`] that can be `tokio::spawn`ed
     /// directly.
-    pub fn into_task(self) -> impl Future<Output = anyhow::Result<()>> {
-        async move { self.run_inner().await }
+    pub async fn into_task(self) -> anyhow::Result<()> {
+        self.run_inner().await
     }
 
     /// Runs connect/reconnect cycles: resends un-stored outbox messages on
     /// every connect, processes inbound frames in sequence order, and backs
-    /// off exponentially. Returns only on a terminal conflict.
+    /// off exponentially.
     pub async fn run(&self) -> anyhow::Result<()> {
         self.run_inner().await
     }
@@ -136,17 +116,18 @@ where
         let mut delay = MIN_RECONNECT_DELAY;
         loop {
             let mut was_connected = false;
-            let outcome = self.run_connection(&mut was_connected).await;
-            match outcome {
-                Ok(CycleOutcome::Reconnect) => self.handler.on_disconnected(None),
-                Ok(CycleOutcome::Conflict) => {
-                    self.handler.on_conflict();
-                    if self.conflict_policy == ConflictPolicy::Terminal {
-                        self.handler.on_disconnected(None);
+            let result = self.run_connection(&mut was_connected).await;
+            match result {
+                Ok(()) => self.handler.on_disconnected(None),
+                Err(error) => {
+                    let err_str = error.to_string();
+                    if err_str.contains("connection_replaced") {
+                        self.handler.on_preempted();
+                        self.handler.on_disconnected(Some(err_str));
                         return Ok(());
                     }
+                    self.handler.on_disconnected(Some(err_str));
                 }
-                Err(error) => self.handler.on_disconnected(Some(error.to_string())),
             }
             delay = if was_connected {
                 MIN_RECONNECT_DELAY
@@ -157,7 +138,7 @@ where
         }
     }
 
-    async fn run_connection(&self, was_connected: &mut bool) -> anyhow::Result<CycleOutcome> {
+    async fn run_connection(&self, was_connected: &mut bool) -> anyhow::Result<()> {
         let mut transport = transport::connect(&self.url).await?;
         self.handler.on_connected();
         *was_connected = true;
@@ -173,7 +154,7 @@ where
                 }
                 frame = transport.next_frame() => {
                     let Some(frame) = frame? else {
-                        return Ok(CycleOutcome::Reconnect);
+                        return Ok(());
                     };
                     match frame {
                         relay_frame::ServerFrame::Ready { .. } => {}
@@ -184,7 +165,7 @@ where
                         relay_frame::ServerFrame::Message {
                             sequence, payload, ..
                         } => {
-                            if store::is_new_sequence(self.store.last_received().await, sequence)? {
+                            if store::is_new_sequence(self.store.last_received().await, sequence) {
                                 self.handler.on_payload(payload);
                                 self.store.mark_received(sequence).await?;
                             }
@@ -195,8 +176,8 @@ where
                                 .await?;
                         }
                         relay_frame::ServerFrame::Error { message } => {
-                            if message.starts_with("connection_conflict:") {
-                                return Ok(CycleOutcome::Conflict);
+                            if message.starts_with("connection_replaced:") {
+                                anyhow::bail!("connection_replaced: {message}");
                             }
                             anyhow::bail!("relay rejected a frame: {message}");
                         }
@@ -282,21 +263,13 @@ pub mod relay_frame {
     }
 }
 
-/// Generate a process-unique message id prefix, e.g. `18f3a2b1c4d5-4d2e`.
-pub fn message_prefix() -> String {
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{started_at:x}-{:x}", std::process::id())
-}
-
 pub mod memory {
     use anyhow::{Result, anyhow};
     use serde_json::Value;
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
-    use super::{OutboundMessage, message_prefix};
+    use super::OutboundMessage;
     use crate::store::OutboxStore;
 
     #[derive(Default)]
@@ -308,20 +281,9 @@ pub mod memory {
     /// Non-durable in-memory store. Payloads queued while offline survive
     /// reconnects but not process restarts; prefer a durable store in
     /// production.
+    #[derive(Default)]
     pub struct MemoryStore {
-        prefix: String,
-        next: std::sync::atomic::AtomicU64,
         state: Mutex<State>,
-    }
-
-    impl Default for MemoryStore {
-        fn default() -> Self {
-            Self {
-                prefix: message_prefix(),
-                next: std::sync::atomic::AtomicU64::new(1),
-                state: Mutex::default(),
-            }
-        }
     }
 
     impl MemoryStore {
@@ -333,11 +295,7 @@ pub mod memory {
     #[async_trait::async_trait]
     impl OutboxStore for MemoryStore {
         async fn enqueue(&self, payload: Value) -> Result<String> {
-            let message_id = format!(
-                "{}-{:x}",
-                self.prefix,
-                self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
+            let message_id = Uuid::new_v4().to_string();
             self.state.lock().await.outbox.push(OutboundMessage {
                 message_id: message_id.clone(),
                 payload,

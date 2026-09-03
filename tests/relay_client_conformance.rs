@@ -11,7 +11,7 @@ use std::{
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use relay_client::{
-    Client, ClientHandler, ConflictPolicy, OutboundMessage,
+    Client, ClientHandler, OutboundMessage,
     relay_frame::{ClientFrame, ServerFrame},
     store::OutboxStore,
 };
@@ -65,7 +65,7 @@ type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn raw_connect(port: u16, id: &str, endpoint: &str) -> Socket {
-    let url = format!("ws://127.0.0.1:{port}/ws?id={id}&endpoint={endpoint}");
+    let url = format!("ws://127.0.0.1:{port}/ws?id={id}&endpoint={endpoint}&device_id=raw");
     for _ in 0..100 {
         if let Ok((socket, _)) = tokio_tungstenite::connect_async(&url).await {
             return socket;
@@ -185,8 +185,8 @@ async fn resends_outbox_receives_and_acks_peer_messages() {
     store.enqueue(json!({ "outbox": 1 })).await.unwrap();
 
     let handler = Arc::new(CollectHandler::default());
-    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-a&endpoint=1");
-    let client = Client::new(url, store.clone(), handler.clone(), ConflictPolicy::Retry);
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-a&endpoint=1&device_id=c1");
+    let client = Client::new(url, store.clone(), handler.clone());
     let run_task = tokio::spawn(client.into_task());
 
     let mut endpoint_two = raw_connect(port, "pair-a", "2").await;
@@ -246,12 +246,11 @@ async fn replays_only_unacked_messages_after_server_restart() {
     let mut server = RelayServer::spawn(port, &database);
 
     let handler = Arc::new(CollectHandler::default());
-    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-r&endpoint=1");
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-r&endpoint=1&device_id=c1");
     let client = Client::new(
         url,
         Arc::new(TestStore::default()),
         handler.clone(),
-        ConflictPolicy::Retry,
     );
     let run_task = tokio::spawn(client.into_task());
 
@@ -307,8 +306,8 @@ async fn multiple_outbox_messages_forward_in_sequence_order() {
     store.enqueue(json!({ "n": 2 })).await.unwrap();
 
     let handler = Arc::new(CollectHandler::default());
-    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-d&endpoint=1");
-    let client = Client::new(url, store.clone(), handler.clone(), ConflictPolicy::Retry);
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-d&endpoint=1&device_id=c1");
+    let client = Client::new(url, store.clone(), handler.clone());
     let run_task = tokio::spawn(client.into_task());
 
     let mut endpoint_two = raw_connect(port, "pair-d", "2").await;
@@ -343,8 +342,8 @@ async fn sends_live_messages_while_connected_and_removes_on_stored() {
 
     let store = Arc::new(TestStore::default());
     let handler = Arc::new(CollectHandler::default());
-    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-live&endpoint=1");
-    let client = Client::new(url, store.clone(), handler.clone(), ConflictPolicy::Retry);
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-live&endpoint=1&device_id=c1");
+    let client = Client::new(url, store.clone(), handler.clone());
     let run_task = tokio::spawn(client.clone().into_task());
 
     let mut endpoint_two = raw_connect(port, "pair-live", "2").await;

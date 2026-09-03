@@ -53,24 +53,28 @@ docker run --rm \
 
 ## Connect
 
-Each channel has two numbered endpoints. Connect one client as endpoint 1 and
-the other as endpoint 2, using the same URL-encoded pairing id:
+Each channel has two numbered endpoints. Connect clients as endpoint 1 or endpoint 2,
+specifying the URL-encoded pairing id and a unique `device_id`:
 
 ```text
-wss://relay.example/ws?id=<pair-id>&endpoint=1
-wss://relay.example/ws?id=<pair-id>&endpoint=2
+wss://relay.example/ws?id=<pair-id>&endpoint=1&device_id=desktop
+wss://relay.example/ws?id=<pair-id>&endpoint=2&device_id=phone_a
+wss://relay.example/ws?id=<pair-id>&endpoint=2&device_id=phone_b
 ```
 
-Messages are isolated by pairing id and only forwarded to the opposite endpoint
-with the same id. The first connection for `(id, endpoint)` remains active; another
-connection for the same key receives a `connection_conflict` error and closes,
-without disconnecting the existing client. Either endpoint may connect first;
-messages wait in SQLite until its peer connects. The SQLite storage layer uses
-SeaORM entities, transactions, and schema builders rather than handwritten SQL.
+Messages are isolated by pairing id and forwarded to the opposite endpoint with
+the same id:
 
-Clients should treat `connection_conflict` as terminal instead of immediately
-reconnecting. They may connect again after an operator resolves the duplicate
-client or after the active connection ends.
+- **Multi-Device Support**: Multiple devices with distinct `device_id`s can connect
+  to the same endpoint simultaneously without conflicts. Inbound messages destined
+  for that endpoint are broadcast in real-time to all currently active devices. Each
+  device maintains its own durable acknowledgment cursor; pending messages remain
+  available for offline devices and are purged only after all registered devices of
+  that endpoint have acknowledged them (or when the message retention period expires).
+- **Preemption (Takeover)**: If a connection opens with an already-active
+  `(id, endpoint, device_id)`, the relay preempts (replaces) the older socket with
+  a `connection_replaced` error frame, allowing mobile clients switching networks
+  (e.g. WiFi to 5G) to resume immediately without waiting for half-open idle timeouts.
 
 The pairing id is the channel's access credential. Generate it with sufficient
 entropy, keep it secret, and avoid recording WebSocket query strings in proxy

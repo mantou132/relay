@@ -2,6 +2,7 @@ mod config;
 mod database;
 mod entity;
 mod hub;
+mod keyed_lock;
 mod server;
 
 use anyhow::Result;

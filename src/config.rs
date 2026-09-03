@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-const DEFAULT_MAX_PENDING_MESSAGES: u64 = 10_000;
+const DEFAULT_MAX_PENDING_MESSAGES: u64 = 100_000;
 const DEFAULT_MAX_PENDING_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_PENDING_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_RECEIPT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;

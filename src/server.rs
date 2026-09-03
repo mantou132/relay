@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use relay::{ClientFrame, Endpoint, ServerFrame};
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use tracing::{Instrument, debug, error, info, warn};
 
@@ -23,6 +23,7 @@ use crate::{
     config::{Args, Limits},
     database::{CleanupStats, Database},
     hub::Hub,
+    keyed_lock::KeyedLock,
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -33,14 +34,15 @@ struct AppState {
     database: Arc<Database>,
     hub: Arc<Hub>,
     limits: Limits,
-    /// Prevents a message from landing between reconnect replay and hub registration.
-    delivery: Arc<Mutex<()>>,
+    /// Fine-grained keyed locks per relay_id to eliminate cross-pairing contention.
+    delivery: Arc<KeyedLock>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConnectQuery {
     id: String,
     endpoint: Endpoint,
+    device_id: String,
 }
 
 async fn websocket_handler(
@@ -60,6 +62,8 @@ async fn websocket_handler(
 fn validate_connection(query: &ConnectQuery) -> Result<()> {
     anyhow::ensure!(!query.id.is_empty(), "id must not be empty");
     anyhow::ensure!(query.id.len() <= MAX_ID_BYTES, "id is too long");
+    anyhow::ensure!(!query.device_id.is_empty(), "device_id must not be empty");
+    anyhow::ensure!(query.device_id.len() <= MAX_ID_BYTES, "device_id is too long");
     Ok(())
 }
 
@@ -73,6 +77,7 @@ async fn serve_socket(
         "websocket",
         relay_id = %query.id,
         endpoint = %query.endpoint,
+        device_id = %query.device_id,
         %peer_addr
     );
     serve_socket_inner(state, query, socket)
@@ -82,41 +87,55 @@ async fn serve_socket(
 
 async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: WebSocket) {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let registration = {
-        let _delivery = state.delivery.lock().await;
-        if state.hub.contains(&query.id, query.endpoint) {
-            None
-        } else {
-            let pending = match state.database.pending(&query.id, query.endpoint).await {
-                Ok(pending) => pending,
-                Err(error) => {
-                    error!(%error, "failed to read pending relay messages");
-                    reject_socket(
-                        &mut socket,
-                        "relay_storage_unavailable: pending messages could not be read",
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let replayed = pending.len();
-            let token = state
-                .hub
-                .register(&query.id, query.endpoint, tx.clone(), pending);
-            Some((token, replayed))
+    let (token, replayed) = {
+        let _delivery = state.delivery.lock(&query.id).await;
+
+        if let Err(error) = state
+            .database
+            .register_device(&query.id, query.endpoint, &query.device_id)
+            .await
+        {
+            error!(%error, "failed to register relay device");
+            reject_socket(
+                &mut socket,
+                "relay_storage_unavailable: device registration failed",
+            )
+            .await;
+            return;
         }
+
+        let pending = match state
+            .database
+            .pending_for_device(&query.id, query.endpoint, &query.device_id)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                error!(%error, "failed to read pending relay messages");
+                reject_socket(
+                    &mut socket,
+                    "relay_storage_unavailable: pending messages could not be read",
+                )
+                .await;
+                return;
+            }
+        };
+        let replayed = pending.len();
+        let token = state.hub.register(
+            &query.id,
+            query.endpoint,
+            &query.device_id,
+            tx.clone(),
+            pending,
+        );
+        (token, replayed)
     };
 
-    let Some((token, replayed)) = registration else {
-        debug!("WebSocket connection rejected: endpoint already connected");
-        reject_socket(
-            &mut socket,
-            "connection_conflict: this id and endpoint already has an active connection",
-        )
-        .await;
-        return;
-    };
-    debug!(replayed_messages = replayed, "WebSocket endpoint connected");
+    debug!(
+        replayed_messages = replayed,
+        device_id = %query.device_id,
+        "WebSocket endpoint connected"
+    );
 
     let (mut sink, mut stream) = socket.split();
     let ping_interval = state.limits.ping_interval;
@@ -172,7 +191,10 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
             }
         };
         last_activity = Instant::now();
-        if !state.hub.is_current(&query.id, query.endpoint, token) {
+        if !state
+            .hub
+            .is_current(&query.id, query.endpoint, &query.device_id, token)
+        {
             break;
         }
         let text = match message {
@@ -198,7 +220,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 payload,
             } => {
                 debug!(%message_id, payload = %payload, "message received");
-                let _delivery = state.delivery.lock().await;
+                let _delivery = state.delivery.lock(&query.id).await;
                 match state
                     .database
                     .store(&query.id, query.endpoint, &message_id, &payload)
@@ -209,7 +231,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                             message_id: message_id.clone(),
                         });
                         if let Some(pending) = stored.pending {
-                            state.hub.send(
+                            state.hub.send_to_endpoint(
                                 &query.id,
                                 query.endpoint.opposite(),
                                 pending.into_frame(),
@@ -226,10 +248,10 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
             }
             ClientFrame::Ack { sequence } => {
                 debug!(sequence, "acknowledgement received");
-                let _delivery = state.delivery.lock().await;
+                let _delivery = state.delivery.lock(&query.id).await;
                 if let Err(error) = state
                     .database
-                    .acknowledge(&query.id, query.endpoint, sequence)
+                    .acknowledge(&query.id, query.endpoint, &query.device_id, sequence)
                     .await
                 {
                     debug!(sequence, %error, "acknowledgement failed");
@@ -241,10 +263,12 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
         }
     }
 
-    state.hub.remove(&query.id, query.endpoint, token);
+    state
+        .hub
+        .remove(&query.id, query.endpoint, &query.device_id, token);
     writer.abort();
     let _ = writer.await;
-    debug!("WebSocket endpoint disconnected");
+    debug!(device_id = %query.device_id, "WebSocket endpoint disconnected");
 }
 
 /// Sends a terminal error frame and closes the socket, used when a connection
