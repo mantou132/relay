@@ -18,6 +18,8 @@
 pub mod store;
 pub mod transport;
 
+pub use relay_frame::{ClientFrame, Endpoint, ServerFrame};
+
 use std::{future::Future, sync::Arc, time::Duration};
 
 use serde_json::Value;

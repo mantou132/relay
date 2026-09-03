@@ -1,6 +1,6 @@
 {
   "name": "relay-client-ts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reliable WebSocket client for the durable relay server",
   "type": "module",
   "main": "src/relay-client.ts",

@@ -1,6 +1,9 @@
 .git
 .github
 target
+**/target
 relay.sqlite3*
 .DS_Store
+node_modules
+**/node_modules
 

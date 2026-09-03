@@ -57,11 +57,13 @@ export type RelayClientOptions = {
   onPayload: (payload: unknown) => void | Promise<void>;
   onStateChange?: (state: RelayConnectionState, error?: string) => void;
   onDisconnect?: (error: Error) => void;
+  /** Storage key in localStorage if default store is used. Defaults to 'relay-client.v1'. */
+  storageKey?: string;
   /** Defaults to a localStorage-backed store. */
   store?: RelayStore;
   /**
-   * What to do on `connection_conflict`. `retry` (default) keeps backing off
-   * because the relay drops silent connections, releasing the slot; `terminal`
+   * What to do on `connection_conflict`. `retry` keeps backing off
+   * because the relay drops silent connections, releasing the slot; `terminal` (default)
    * stops after the conflict.
    */
   conflictPolicy?: 'retry' | 'terminal';
@@ -86,20 +88,31 @@ export const isNewSequence = (lastReceived: number | undefined, sequence: number
   return true;
 };
 
-const STORAGE_PREFIX = 'relay-client.v1.';
+export const DEFAULT_STORAGE_KEY = 'relay-client.v1';
 
-const localStorageStore = (relayId: string): RelayStore => {
-  const key = `${STORAGE_PREFIX}${relayId}`;
-  const load = (): { prefix: string; nextMessage: number; lastReceived?: number; outbox: OutboundMessage[] } => {
+export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_KEY): RelayStore => {
+  const key = storageKey;
+  type StoredState = {
+    relayId: string;
+    prefix: string;
+    nextMessage: number;
+    lastReceived?: number;
+    outbox: OutboundMessage[];
+  };
+
+  const load = (): StoredState => {
     try {
-      const value = JSON.parse(localStorage.getItem(key) || 'null');
+      const raw = localStorage.getItem(key);
+      const value = raw ? JSON.parse(raw) : null;
       if (
         value &&
+        value.relayId === relayId &&
         typeof value.prefix === 'string' &&
         Number.isSafeInteger(value.nextMessage) &&
         Array.isArray(value.outbox)
       ) {
         return {
+          relayId,
           prefix: value.prefix,
           nextMessage: value.nextMessage,
           ...(Number.isSafeInteger(value.lastReceived) ? { lastReceived: value.lastReceived } : {}),
@@ -110,12 +123,12 @@ const localStorageStore = (relayId: string): RelayStore => {
         };
       }
     } catch {
-      // Corrupt state is replaced with a fresh outbox; the pairing id is
+      // Corrupt or outdated state is replaced with a fresh outbox; the pairing id is
       // untouched so the user can still reconnect from settings.
     }
-    return { prefix: crypto.randomUUID(), nextMessage: 0, outbox: [] };
+    return { relayId, prefix: crypto.randomUUID(), nextMessage: 0, outbox: [] };
   };
-  const save = (state: ReturnType<typeof load>) => localStorage.setItem(key, JSON.stringify(state));
+  const save = (state: StoredState) => localStorage.setItem(key, JSON.stringify(state));
   return {
     outbox: () => load().outbox,
     enqueue: (message) => {
@@ -159,6 +172,7 @@ export class RelayClient {
     onPayload,
     onStateChange,
     onDisconnect,
+    storageKey,
     store,
     conflictPolicy = 'terminal',
   }: RelayClientOptions) {
@@ -166,7 +180,7 @@ export class RelayClient {
     this.relayId = relayId;
     this.#endpoint = endpoint;
     this.#relayUrl = relayUrl;
-    this.#store = store ?? localStorageStore(relayId);
+    this.#store = store ?? localStorageStore(relayId, storageKey);
     this.#conflictPolicy = conflictPolicy;
     this.#onPayload = onPayload;
     this.#onStateChange = onStateChange;
