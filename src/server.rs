@@ -292,8 +292,9 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     }
                     Err(error) => {
                         debug!(%message_id, %error, "message rejected");
-                        let _ = tx.send(ServerFrame::Error {
-                            message: error.to_string(),
+                        let _ = tx.send(ServerFrame::Rejected {
+                            message_id: message_id.clone(),
+                            reason: error.to_string(),
                         });
                     }
                 }

@@ -386,24 +386,27 @@ impl Database {
             .await?;
         }
 
+        // Find the minimum acknowledged sequence across all active devices registered
+        // for this (relay_id, destination). Devices inactive for device_retention_secs
+        // are excluded to prevent abandoned devices from permanently blocking queue pruning.
+        let device_cutoff = now.saturating_sub(self.limits.device_retention_secs);
         let all_devices = device::Entity::find()
             .filter(device::Column::RelayId.eq(relay_id))
             .filter(device::Column::Endpoint.eq(destination.to_string()))
+            .filter(device::Column::LastSeenAt.gte(device_cutoff))
             .all(&transaction)
             .await?;
 
-        for d in all_devices {
-            if d.last_acked_sequence < head {
-                let mut active = d.into_active_model();
-                active.last_acked_sequence = Set(head);
-                active.update(&transaction).await?;
-            }
-        }
+        let min_acked = all_devices
+            .iter()
+            .map(|d| d.last_acked_sequence)
+            .min()
+            .unwrap_or(head);
 
         let result = pending_message::Entity::delete_many()
             .filter(pending_message::Column::RelayId.eq(relay_id))
             .filter(pending_message::Column::Destination.eq(destination.to_string()))
-            .filter(pending_message::Column::Sequence.lte(head))
+            .filter(pending_message::Column::Sequence.lte(min_acked))
             .exec(&transaction)
             .await?;
 
@@ -849,7 +852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledge_head_clears_all_pending_and_advances_cursors() {
+    async fn acknowledge_head_only_advances_calling_device_cursor() {
         let (_directory, database) = database().await;
 
         database
@@ -884,9 +887,10 @@ mod tests {
             .acknowledge_head("pair-h", Endpoint::Two, "fresh_phone")
             .await
             .unwrap();
-        assert_eq!(deleted, 3);
+        // stale_phone is still active at sequence 0, so min_acked is 0; 0 rows deleted from DB
+        assert_eq!(deleted, 0);
 
-        // Fresh phone gets 0 pending messages
+        // Fresh phone gets 0 pending messages (cursor advanced to head = 3)
         assert!(
             database
                 .pending_for_device("pair-h", Endpoint::Two, "fresh_phone")
@@ -894,21 +898,23 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Stale phone also gets 0 pending messages (messages were deleted)
-        assert!(
+        // Stale phone STILL has 3 pending messages (its cursor was NOT tampered with!)
+        assert_eq!(
             database
                 .pending_for_device("pair-h", Endpoint::Two, "stale_phone")
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            3
         );
-        // Pending queue in DB is empty
-        assert!(
+        // Pending queue in DB still contains messages for stale_phone
+        assert_eq!(
             database
                 .pending("pair-h", Endpoint::Two)
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            3
         );
 
         // Subsequent message arrives with sequence 4
@@ -922,19 +928,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending_fresh.len(), 1);
-        // Acknowledging sequence 4 on fresh_phone: stale_phone is at 3, so min_acked is 3 (already deleted)
+
+        // Stale phone sees all 4 messages
+        assert_eq!(
+            database
+                .pending_for_device("pair-h", Endpoint::Two, "stale_phone")
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+
+        // Acknowledging sequence 4 on fresh_phone: stale_phone is at 0, so min_acked is 0
         let deleted = database
             .acknowledge("pair-h", Endpoint::Two, "fresh_phone", 4)
             .await
             .unwrap();
         assert_eq!(deleted, 0);
 
-        // Once stale_phone also acks 4, sequence 4 is deleted
+        // Once stale_phone also acks 4, all sequences up to 4 are deleted
         let deleted = database
             .acknowledge("pair-h", Endpoint::Two, "stale_phone", 4)
             .await
             .unwrap();
+        assert_eq!(deleted, 4);
+
+        // When a single device connects with acknowledge_head and no other devices exist:
+        database
+            .store("pair-single", Endpoint::One, "s-1", &serde_json::json!("s1"))
+            .await
+            .unwrap();
+        let deleted = database
+            .acknowledge_head("pair-single", Endpoint::Two, "solo_device")
+            .await
+            .unwrap();
         assert_eq!(deleted, 1);
+        assert!(
+            database
+                .pending_for_device("pair-single", Endpoint::Two, "solo_device")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

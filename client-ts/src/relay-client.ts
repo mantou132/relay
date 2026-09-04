@@ -27,6 +27,7 @@ export type OutboundMessage = {
 export type ServerFrame =
   | { type: 'ready'; endpoint: '1' | '2' }
   | { type: 'stored'; message_id: string }
+  | { type: 'rejected'; message_id: string; reason: string }
   | { type: 'message'; message_id: string; sequence: number; payload: unknown }
   | { type: 'error'; message: string };
 
@@ -64,6 +65,8 @@ export type RelayClientOptions = {
   onPayload: (payload: unknown) => void | Promise<void>;
   onStateChange?: (state: RelayConnectionState, error?: string) => void;
   onDisconnect?: (error: Error) => void;
+  /** Called when a message is rejected by the server (e.g. queue full, payload too large, invalid format). */
+  onMessageRejected?: (messageId: string, reason: string) => void;
   /** Storage key in localStorage if default store is used. Defaults to 'relay-client.v1'. */
   storageKey?: string;
   /** Defaults to a localStorage-backed store. */
@@ -103,30 +106,38 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
     outbox: OutboundMessage[];
   };
 
-  const load = (): StoredState => {
-    try {
-      const raw = localStorage.getItem(key);
-      if (!raw) return { relayId, deviceId: crypto.randomUUID(), outbox: [] };
-      const parsed = JSON.parse(raw) as Partial<StoredState>;
-      if (parsed.relayId !== relayId) {
-        return { relayId, deviceId: parsed.deviceId ?? crypto.randomUUID(), outbox: [] };
-      }
-      return {
-        relayId,
-        deviceId: parsed.deviceId ?? crypto.randomUUID(),
-        lastReceived: parsed.lastReceived,
-        outbox: Array.isArray(parsed.outbox) ? parsed.outbox : [],
-      };
-    } catch {
-      return { relayId, deviceId: crypto.randomUUID(), outbox: [] };
-    }
-  };
-
   const save = (state: StoredState) => {
     try {
       localStorage.setItem(key, JSON.stringify(state));
     } catch {
       // Quota exceeded or private browsing restrictions
+    }
+  };
+
+  const load = (): StoredState => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) {
+        const fresh: StoredState = { relayId, deviceId: crypto.randomUUID(), outbox: [] };
+        save(fresh);
+        return fresh;
+      }
+      const parsed = JSON.parse(raw) as Partial<StoredState>;
+      const deviceId = parsed.deviceId || crypto.randomUUID();
+      const state: StoredState = {
+        relayId,
+        deviceId,
+        lastReceived: parsed.relayId === relayId ? parsed.lastReceived : undefined,
+        outbox: parsed.relayId === relayId && Array.isArray(parsed.outbox) ? parsed.outbox : [],
+      };
+      if (!parsed.deviceId || parsed.relayId !== relayId) {
+        save(state);
+      }
+      return state;
+    } catch {
+      const fallback: StoredState = { relayId, deviceId: crypto.randomUUID(), outbox: [] };
+      save(fallback);
+      return fallback;
     }
   };
 
@@ -162,6 +173,7 @@ export class RelayClient {
   #onPayload: RelayClientOptions['onPayload'];
   #onStateChange?: RelayClientOptions['onStateChange'];
   #onDisconnect?: RelayClientOptions['onDisconnect'];
+  #onMessageRejected?: RelayClientOptions['onMessageRejected'];
   #socket?: WebSocket;
   #sent = new Set<string>();
   #relayReady = false;
@@ -180,6 +192,7 @@ export class RelayClient {
     onPayload,
     onStateChange,
     onDisconnect,
+    onMessageRejected,
     storageKey,
     store,
   }: RelayClientOptions) {
@@ -196,6 +209,7 @@ export class RelayClient {
     this.#onPayload = onPayload;
     this.#onStateChange = onStateChange;
     this.#onDisconnect = onDisconnect;
+    this.#onMessageRejected = onMessageRejected;
   }
 
   connect = async (options?: { ackHead?: boolean }) => {
@@ -208,16 +222,19 @@ export class RelayClient {
     clearTimeout(this.#reconnectTimer);
     this.#emitState('connecting');
 
-    if (!this.#deviceId && this.#store.deviceId) {
-      this.#deviceId = await this.#store.deviceId();
+    if (!this.#deviceId) {
+      if (this.#store.deviceId) {
+        this.#deviceId = await this.#store.deviceId();
+      }
+      if (!this.#deviceId) {
+        this.#deviceId = crypto.randomUUID();
+      }
     }
 
     const url = new URL(this.#relayUrl);
     url.searchParams.set('id', this.relayId);
     url.searchParams.set('endpoint', this.#endpoint);
-    if (this.#deviceId) {
-      url.searchParams.set('device_id', this.#deviceId);
-    }
+    url.searchParams.set('device_id', this.#deviceId);
     if (this.#ackHead) {
       url.searchParams.set('ack_head', 'true');
     }
@@ -292,6 +309,12 @@ export class RelayClient {
         await this.#store.removeFromOutbox(frame.message_id);
         return;
       }
+      case 'rejected': {
+        this.#sent.delete(frame.message_id);
+        await this.#store.removeFromOutbox(frame.message_id);
+        this.#onMessageRejected?.(frame.message_id, frame.reason);
+        return;
+      }
       case 'message': {
         const lastReceived = await this.#store.lastReceived();
         if (!isNewSequence(lastReceived, frame.sequence)) {
@@ -309,7 +332,7 @@ export class RelayClient {
           this.#socket?.close();
           return;
         }
-        throw new Error(`Relay 拒绝消息：${frame.message}`);
+        throw new Error(`Relay 错误：${frame.message}`);
     }
   };
 

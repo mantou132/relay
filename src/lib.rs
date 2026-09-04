@@ -57,6 +57,12 @@ pub enum ServerFrame {
     Stored {
         message_id: String,
     },
+    /// The server rejected an outbound message. The sender removes it from its outbox
+    /// to avoid retrying a permanent failure.
+    Rejected {
+        message_id: String,
+        reason: String,
+    },
     Message {
         message_id: String,
         sequence: u64,

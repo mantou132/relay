@@ -446,3 +446,92 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
     run_task.abort();
 }
 
+#[derive(Default)]
+struct PoisonPillHandler {
+    rejected: std::sync::Mutex<Vec<(String, String)>>,
+    disconnected: std::sync::atomic::AtomicBool,
+}
+
+impl ClientHandler for PoisonPillHandler {
+    fn on_payload(&self, _payload: Value) {}
+    fn on_disconnected(&self, _error: Option<String>) {
+        self.disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_message_rejected(&self, message_id: &str, reason: &str) {
+        self.rejected
+            .lock()
+            .unwrap()
+            .push((message_id.to_string(), reason.to_string()));
+    }
+}
+
+#[tokio::test]
+async fn rejected_message_does_not_poison_outbox_or_disconnect_client() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = free_port();
+    let _server = RelayServer::spawn(port, &database);
+
+    // Pre-populate the database with "conflict-id" having payload {"valid": 1}
+    let mut raw_peer = raw_connect(port, "pair-poison", "1").await;
+    send_client_frame(
+        &mut raw_peer,
+        &ClientFrame::Message {
+            message_id: "conflict-id".to_string(),
+            payload: json!({ "valid": 1 }),
+        },
+    )
+    .await;
+    let _ = read_until(&mut raw_peer, |f| matches!(f, ServerFrame::Stored { .. })).await;
+
+    // Start a client on endpoint 1 that has 2 messages in its outbox:
+    // 1. "conflict-id" with a DIFFERENT payload -> server will reject with Error!
+    // 2. "good-msg" with valid payload -> server will store successfully!
+    let store = Arc::new(TestStore::default());
+    {
+        let mut outbox = store.outbox.lock().await;
+        outbox.push(OutboundMessage {
+            message_id: "conflict-id".to_string(),
+            payload: json!({ "different": 2 }),
+        });
+        outbox.push(OutboundMessage {
+            message_id: "good-msg".to_string(),
+            payload: json!({ "good": true }),
+        });
+    }
+
+    let handler = Arc::new(PoisonPillHandler::default());
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-poison&endpoint=1&device_id=client-1");
+    let client = Client::new(url, store.clone(), handler.clone());
+    let run_task = tokio::spawn(client.into_task());
+
+    // Wait until conflict-id is rejected via callback
+    wait_until(
+        || !handler.rejected.lock().unwrap().is_empty(),
+        "rejection callback called",
+    )
+    .await;
+
+    let (rejected_id, reason) = handler.rejected.lock().unwrap()[0].clone();
+    assert_eq!(rejected_id, "conflict-id");
+    assert!(reason.contains("message_id was already used with a different payload"));
+
+    // Verify client did NOT disconnect
+    assert!(!handler.disconnected.load(std::sync::atomic::Ordering::Relaxed));
+
+    // Wait until outbox is completely drained without poison pill loop
+    wait_until(
+        || {
+            store
+                .outbox
+                .try_lock()
+                .map(|outbox| outbox.is_empty())
+                .unwrap_or(false)
+        },
+        "outbox drained without poison pill hang",
+    )
+    .await;
+
+    run_task.abort();
+}
+

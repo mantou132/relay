@@ -126,6 +126,7 @@ Server to client:
 ```json
 {"type":"ready","endpoint":"1"}
 {"type":"stored","message_id":"stable-client-generated-id"}
+{"type":"rejected","message_id":"stable-client-generated-id","reason":"description"}
 {"type":"message","message_id":"peer-message-id","sequence":42,"payload":{"any":"json"}}
 {"type":"error","message":"description"}
 ```

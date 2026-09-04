@@ -47,6 +47,8 @@ pub trait ClientHandler: Send + Sync + 'static {
     fn on_disconnected(&self, _error: Option<String>) {}
     /// Called when another connection with the same device_id preempts this connection.
     fn on_preempted(&self) {}
+    /// Called when a message was rejected by the server (e.g. invalid format, queue full, conflict).
+    fn on_message_rejected(&self, _message_id: &str, _reason: &str) {}
 }
 
 pub struct Client<S, H> {
@@ -222,6 +224,11 @@ where
                             self.store.remove_from_outbox(&message_id).await;
                             sent.remove(&message_id);
                         }
+                        relay_frame::ServerFrame::Rejected { message_id, reason } => {
+                            self.store.remove_from_outbox(&message_id).await;
+                            sent.remove(&message_id);
+                            self.handler.on_message_rejected(&message_id, &reason);
+                        }
                         relay_frame::ServerFrame::Message {
                             sequence, payload, ..
                         } => {
@@ -311,6 +318,10 @@ pub mod relay_frame {
         },
         Stored {
             message_id: String,
+        },
+        Rejected {
+            message_id: String,
+            reason: String,
         },
         Message {
             message_id: String,
