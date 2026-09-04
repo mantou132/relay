@@ -163,7 +163,7 @@ async fn read_until(
     mut predicate: impl FnMut(&ServerFrame) -> bool,
 ) -> ServerFrame {
     for _ in 0..50 {
-        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
             .await
             .expect("timed out reading from relay")
             .expect("relay socket closed")

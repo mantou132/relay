@@ -319,11 +319,14 @@ impl Database {
             .await?;
         }
 
-        // Find the minimum acknowledged sequence across all devices registered
-        // for this (relay_id, destination).
+        // Find the minimum acknowledged sequence across all active devices registered
+        // for this (relay_id, destination). Devices inactive for device_retention_secs
+        // are excluded to prevent abandoned devices from permanently blocking queue pruning.
+        let device_cutoff = now.saturating_sub(self.limits.device_retention_secs);
         let all_devices = device::Entity::find()
             .filter(device::Column::RelayId.eq(relay_id))
             .filter(device::Column::Endpoint.eq(destination.to_string()))
+            .filter(device::Column::LastSeenAt.gte(device_cutoff))
             .all(&transaction)
             .await?;
 
@@ -457,10 +460,11 @@ impl Database {
             .exec(&transaction)
             .await?
             .rows_affected;
-        // Expire stale devices that have not been seen for receipt_retention_secs,
+        // Expire stale devices that have not been seen for device_retention_secs,
         // ensuring abandoned devices do not permanently block queue pruning.
+        let device_cutoff = now.saturating_sub(self.limits.device_retention_secs);
         let _expired_devices = device::Entity::delete_many()
-            .filter(device::Column::LastSeenAt.lt(receipt_cutoff))
+            .filter(device::Column::LastSeenAt.lt(device_cutoff))
             .exec(&transaction)
             .await?
             .rows_affected;
@@ -931,6 +935,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn inactive_device_timeout_unblocks_queue_pruning() {
+        let limits = Limits {
+            device_retention_secs: 10,
+            ..Limits::default()
+        };
+        let (_directory, database) = database_with_limits(limits).await;
+
+        database
+            .register_device("pair-t", Endpoint::Two, "phone_abandoned")
+            .await
+            .unwrap();
+        database
+            .register_device("pair-t", Endpoint::Two, "phone_active")
+            .await
+            .unwrap();
+
+        database
+            .store("pair-t", Endpoint::One, "m1", &serde_json::json!("1"))
+            .await
+            .unwrap();
+
+        // Age phone_abandoned so its last_seen_at is in the past
+        device::Entity::update_many()
+            .col_expr(device::Column::LastSeenAt, Expr::value(1))
+            .filter(device::Column::DeviceId.eq("phone_abandoned"))
+            .exec(&database.connection)
+            .await
+            .unwrap();
+
+        // phone_active acks sequence 1
+        let deleted = database
+            .acknowledge("pair-t", Endpoint::Two, "phone_active", 1)
+            .await
+            .unwrap();
+
+        // Abandoned phone is ignored due to device_retention_secs cutoff, so message 1 is deleted!
+        assert_eq!(deleted, 1);
+        assert!(
+            database
+                .pending("pair-t", Endpoint::Two)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

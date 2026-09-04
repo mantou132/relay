@@ -275,3 +275,36 @@ async fn same_device_reconnection_preempts_old_socket() {
         }
     );
 }
+
+#[tokio::test]
+async fn health_check_http_endpoint() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _server = RelayServer::spawn(port, &database);
+
+    // Test GET /health with retry
+    let mut response = String::new();
+    for _ in 0..100 {
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut res = String::new();
+            if stream.read_to_string(&mut res).await.is_ok() && !res.is_empty() {
+                response = res;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "health check failed: {response}");
+    assert!(response.contains("OK"));
+}

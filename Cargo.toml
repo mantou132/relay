@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "client-rs"]
+
 [package]
 name = "relay"
 version = "0.1.0"

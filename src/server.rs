@@ -141,11 +141,11 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
         }
 
         if query.ack_head {
-            if let Err(error) = state
+            let res = state
                 .database
                 .acknowledge_head(&query.id, query.endpoint, &query.device_id)
-                .await
-            {
+                .await;
+            if let Err(error) = res {
                 error!(%error, "failed to acknowledge head for relay device");
                 reject_socket(
                     &mut socket,
@@ -336,6 +336,10 @@ async fn reject_socket(socket: &mut WebSocket, message: &str) {
     let _ = socket.send(Message::Close(None)).await;
 }
 
+async fn health_handler() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
 pub(crate) async fn run(args: Args) -> Result<()> {
     let limits = Limits::from_args(&args)?;
     let database = Arc::new(Database::open(&args.database, limits).await?);
@@ -353,6 +357,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     };
     let router = Router::new()
         .route("/ws", get(websocket_handler))
+        .route("/health", get(health_handler))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await

@@ -55,6 +55,8 @@ pub struct Client<S, H> {
     store: Arc<S>,
     handler: Arc<H>,
     notify_send: Arc<tokio::sync::Notify>,
+    shutdown: Arc<tokio::sync::Notify>,
+    is_closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S, H> Clone for Client<S, H> {
@@ -65,6 +67,8 @@ impl<S, H> Clone for Client<S, H> {
             store: self.store.clone(),
             handler: self.handler.clone(),
             notify_send: self.notify_send.clone(),
+            shutdown: self.shutdown.clone(),
+            is_closed: self.is_closed.clone(),
         }
     }
 }
@@ -94,7 +98,15 @@ where
             store,
             handler,
             notify_send: Arc::new(tokio::sync::Notify::new()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Signals the client to stop running and disconnect cleanly.
+    pub fn close(&self) {
+        self.is_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown.notify_waiters();
     }
 
     /// Enqueues a message into the store and notifies the connection loop to
@@ -127,26 +139,47 @@ where
     async fn run_inner(&self) -> anyhow::Result<()> {
         let mut delay = MIN_RECONNECT_DELAY;
         loop {
+            if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+
             let mut was_connected = false;
-            let result = self.run_connection(&mut was_connected).await;
-            match result {
-                Ok(()) => self.handler.on_disconnected(None),
-                Err(error) => {
-                    let err_str = error.to_string();
-                    if err_str.contains("connection_replaced") {
-                        self.handler.on_preempted();
-                        self.handler.on_disconnected(Some(err_str));
-                        return Ok(());
+            tokio::select! {
+                _ = self.shutdown.notified() => {
+                    return Ok(());
+                }
+                result = self.run_connection(&mut was_connected) => {
+                    match result {
+                        Ok(()) => self.handler.on_disconnected(None),
+                        Err(error) => {
+                            let err_str = error.to_string();
+                            if err_str.contains("connection_replaced") {
+                                self.handler.on_preempted();
+                                self.handler.on_disconnected(Some(err_str));
+                                return Ok(());
+                            }
+                            self.handler.on_disconnected(Some(err_str));
+                        }
                     }
-                    self.handler.on_disconnected(Some(err_str));
                 }
             }
+
+            if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+
             delay = if was_connected {
                 MIN_RECONNECT_DELAY
             } else {
                 delay.mul_f64(2.0).min(MAX_RECONNECT_DELAY)
             };
-            tokio::time::sleep(delay).await;
+
+            tokio::select! {
+                _ = self.shutdown.notified() => {
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
         }
     }
 
@@ -159,24 +192,32 @@ where
         };
         let mut transport = transport::connect(&connect_url).await?;
         self.ack_head.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.handler.on_connected();
-        *was_connected = true;
 
         let mut sent = std::collections::HashSet::new();
-        // Nothing was acked while disconnected; resend everything un-stored.
-        self.flush_outbox(&mut transport, &mut sent).await?;
+        let mut ready = false;
 
         loop {
             tokio::select! {
+                _ = self.shutdown.notified() => {
+                    return Ok(());
+                }
                 _ = self.notify_send.notified() => {
-                    self.flush_outbox(&mut transport, &mut sent).await?;
+                    if ready {
+                        self.flush_outbox(&mut transport, &mut sent).await?;
+                    }
                 }
                 frame = transport.next_frame() => {
                     let Some(frame) = frame? else {
                         return Ok(());
                     };
                     match frame {
-                        relay_frame::ServerFrame::Ready { .. } => {}
+                        relay_frame::ServerFrame::Ready { .. } => {
+                            ready = true;
+                            self.handler.on_connected();
+                            *was_connected = true;
+                            // Resend everything un-stored once server confirms ready.
+                            self.flush_outbox(&mut transport, &mut sent).await?;
+                        }
                         relay_frame::ServerFrame::Stored { message_id } => {
                             self.store.remove_from_outbox(&message_id).await;
                             sent.remove(&message_id);
@@ -348,3 +389,34 @@ pub mod memory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryStore;
+
+    struct DummyHandler;
+    impl ClientHandler for DummyHandler {
+        fn on_payload(&self, _payload: serde_json::Value) {}
+    }
+
+    #[tokio::test]
+    async fn client_close_exits_run_loop() {
+        let store = Arc::new(MemoryStore::new());
+        let handler = Arc::new(DummyHandler);
+        let client = Client::new("ws://127.0.0.1:9".to_string(), store, handler);
+
+        let c = client.clone();
+        let handle = tokio::spawn(async move {
+            c.run().await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.close();
+
+        let res = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        assert!(res.is_ok(), "client.run() should exit promptly after close()");
+        assert!(res.unwrap().unwrap().is_ok());
+    }
+}
+

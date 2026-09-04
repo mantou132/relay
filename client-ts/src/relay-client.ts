@@ -73,8 +73,8 @@ export type RelayClientOptions = {
 const MIN_RECONNECT_DELAY = 1_000;
 const MAX_RECONNECT_DELAY = 30_000;
 
-export const isRelayId = (value: string) =>
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+export const isRelayId = (value: string): boolean =>
+  typeof value === 'string' && value.trim().length > 0 && new TextEncoder().encode(value).length <= 256;
 
 /**
  * Sequence gate: adopt the first observed sequence, drop duplicates,
@@ -143,7 +143,7 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
       save(state);
     },
     lastReceived: () => load().lastReceived,
-    markReceived: (sequence) => {
+    markReceived: (sequence: number) => {
       const state = load();
       state.lastReceived = sequence;
       save(state);
@@ -183,7 +183,10 @@ export class RelayClient {
     storageKey,
     store,
   }: RelayClientOptions) {
-    if (!isRelayId(relayId)) throw new Error('Relay ID 必须是 UUID');
+    if (!isRelayId(relayId)) throw new Error('Relay ID 必须为 1-256 字节的非空字符串');
+    if (!store && typeof localStorage === 'undefined') {
+      throw new Error('当前环境不存在 localStorage，必须显式传入 store 实现');
+    }
     this.relayId = relayId;
     this.#endpoint = endpoint;
     this.#deviceId = deviceId;

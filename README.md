@@ -12,19 +12,20 @@ cargo run --release -- \
   --database /var/lib/relay/relay.sqlite3
 ```
 
-The default bind address is `127.0.0.1:39371` and the default database is
+The default bind address is `0.0.0.0:39371` and the default database is
 `relay.sqlite3` in the current directory. Every option also has an environment
 variable:
 
 | Option | Environment variable | Default |
 | --- | --- | --- |
 | `--debug` | `RELAY_DEBUG` | enabled automatically in debug builds |
-| `--bind` | `RELAY_BIND` | `127.0.0.1:39371` |
+| `--bind` | `RELAY_BIND` | `0.0.0.0:39371` |
 | `--database` | `RELAY_DATABASE` | `relay.sqlite3` |
-| `--max-pending-messages` | `RELAY_MAX_PENDING_MESSAGES` | `10000` per id and direction |
+| `--max-pending-messages` | `RELAY_MAX_PENDING_MESSAGES` | `100000` per id and direction |
 | `--max-pending-bytes` | `RELAY_MAX_PENDING_BYTES` | `1073741824` per id and direction |
 | `--pending-retention-secs` | `RELAY_PENDING_RETENTION_SECS` | `604800` (7 days) |
 | `--receipt-retention-secs` | `RELAY_RECEIPT_RETENTION_SECS` | `2592000` (30 days) |
+| `--device-retention-secs` | `RELAY_DEVICE_RETENTION_SECS` | `604800` (7 days) |
 | `--cleanup-interval-secs` | `RELAY_CLEANUP_INTERVAL_SECS` | `3600` (1 hour) |
 
 Debug logging records connection and disconnection details, pairing ids,
@@ -53,7 +54,7 @@ docker run --rm \
 
 ## Connect
 
-Each channel has two numbered endpoints. Connect clients as endpoint 1 or endpoint 2,
+Each channel has two numbered endpoints (1 and 2). Connect clients as endpoint 1 or endpoint 2,
 specifying the URL-encoded pairing id and a unique `device_id`:
 
 ```text
@@ -61,6 +62,12 @@ wss://relay.example/ws?id=<pair-id>&endpoint=1&device_id=desktop
 wss://relay.example/ws?id=<pair-id>&endpoint=2&device_id=phone_a
 wss://relay.example/ws?id=<pair-id>&endpoint=2&device_id=phone_b
 ```
+
+Query parameters for `/ws`:
+- `id`: Channel/user pairing identifier (non-empty string, max 256 bytes).
+- `endpoint`: `1` or `2`. Messages sent from 1 are forwarded to 2, and vice versa.
+- `device_id`: Unique stable identifier for this device (non-empty string, max 256 bytes).
+- `ack_head`: Optional boolean (`true` / `1`). When set on connect, resets this endpoint's receive cursor to the latest head sequence, immediately acknowledging and purging unread server backlog so the device only receives subsequent live messages.
 
 Messages are isolated by pairing id and forwarded to the opposite endpoint with
 the same id:
@@ -71,6 +78,10 @@ the same id:
   device maintains its own durable acknowledgment cursor; pending messages remain
   available for offline devices and are purged only after all registered devices of
   that endpoint have acknowledged them (or when the message retention period expires).
+- **Device Lifecycle & Inactivity Cutoff**: Inactive devices that have not connected
+  within `--device-retention-secs` (default: 7 days) are automatically excluded from
+  acknowledgment cursor calculations, preventing abandoned devices from permanently
+  blocking pending message pruning.
 - **Preemption (Takeover)**: If a connection opens with an already-active
   `(id, endpoint, device_id)`, the relay preempts (replaces) the older socket with
   a `connection_replaced` error frame, allowing mobile clients switching networks
@@ -79,6 +90,15 @@ the same id:
 The pairing id is the channel's access credential. Generate it with sufficient
 entropy, keep it secret, and avoid recording WebSocket query strings in proxy
 access logs.
+
+## Health Check
+
+For container orchestrators (Kubernetes, Docker Swarm) and reverse proxies:
+
+```text
+GET /health
+```
+Returns `200 OK` when the service is healthy and ready to accept connections.
 
 ## Single instance
 
@@ -155,3 +175,98 @@ processing a delivered payload.
 Cleanup runs once at startup and periodically afterwards. It removes expired
 rows; SQLite runs in WAL mode with full auto-vacuum so freed pages can be
 returned to the filesystem.
+
+## Client SDKs
+
+The repository includes official clients for Rust and TypeScript/JavaScript implementing the full delivery contract (persistent outbox, automatic retries until `stored`, cumulative acknowledgments, exponential backoff, and preemption handling).
+
+### Rust Client (`client-rs`)
+
+Add to `Cargo.toml`:
+```toml
+[dependencies]
+relay-client = { path = "client-rs" } # or git reference
+```
+
+Example usage:
+```rust
+use std::sync::Arc;
+use relay_client::{Client, ClientHandler, memory::MemoryStore, transport::endpoint_url, Endpoint};
+use serde_json::json;
+
+struct MyHandler;
+
+impl ClientHandler for MyHandler {
+    fn on_payload(&self, payload: serde_json::Value) {
+        println!("Received payload: {payload}");
+    }
+    fn on_connected(&self) {
+        println!("Connected to relay");
+    }
+    fn on_disconnected(&self, error: Option<String>) {
+        println!("Disconnected: {error:?}");
+    }
+    fn on_preempted(&self) {
+        println!("Session preempted by a new connection from the same device");
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let url = endpoint_url("ws://127.0.0.1:39371/ws", "user_123", Endpoint::One, "desktop");
+    let store = Arc::new(MemoryStore::new()); // Use a persistent OutboxStore in production
+    let handler = Arc::new(MyHandler);
+
+    let client = Client::new(url, store, handler);
+
+    // Spawn client connection loop
+    let client_task = client.clone();
+    tokio::spawn(async move {
+        if let Err(err) = client_task.run().await {
+            eprintln!("Client exited: {err}");
+        }
+    });
+
+    // Send a message (queued to outbox and sent to opposite endpoint)
+    let message_id = client.send(json!({ "hello": "world" })).await?;
+
+    // Close client when done (disconnects and exits run loop)
+    // client.close();
+
+    Ok(())
+}
+```
+
+### TypeScript Client (`client-ts`)
+
+Import from `client-ts/src/relay-client.ts` or install `relay-client-ts`:
+
+```typescript
+import { RelayClient } from './client-ts/src/relay-client';
+
+const client = new RelayClient({
+  relayUrl: 'wss://relay.example/ws',
+  relayId: 'user_12345',       // User or pairing identifier (1-256 chars)
+  endpoint: '2',               // Endpoint 1 or 2
+  deviceId: 'phone_a',         // Unique device identifier
+  ackHead: false,              // Set true on initial connect to drop stale backlog
+  onPayload: (payload) => {
+    console.log('Received payload from peer:', payload);
+  },
+  onStateChange: (state, error) => {
+    console.log('Connection state:', state, error);
+  },
+  onDisconnect: (error) => {
+    console.warn('Disconnected:', error.message);
+  },
+});
+
+// Connect to the relay
+await client.connect();
+
+// Send payload to opposite endpoint
+await client.send({ text: 'Hello from phone' });
+
+// Close connection (stops reconnect loop)
+// client.close();
+```
