@@ -91,6 +91,7 @@ impl OutboxStore for TestStore {
         outbox.push(OutboundMessage {
             message_id: message_id.clone(),
             payload,
+            target_device_id: None,
         });
         Ok(message_id)
     }
@@ -266,6 +267,7 @@ async fn replays_only_unacked_messages_after_server_restart() {
         &ClientFrame::Message {
             message_id: "e2-1".into(),
             payload: json!(7),
+            target_device_id: None,
         },
     )
     .await;
@@ -393,6 +395,7 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
         &ClientFrame::Message {
             message_id: "m-1".to_string(),
             payload: json!({ "old": 1 }),
+            target_device_id: None,
         },
     )
     .await;
@@ -403,6 +406,7 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
         &ClientFrame::Message {
             message_id: "m-2".to_string(),
             payload: json!({ "old": 2 }),
+            target_device_id: None,
         },
     )
     .await;
@@ -428,6 +432,7 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
         &ClientFrame::Message {
             message_id: "m-3".to_string(),
             payload: json!({ "live": 3 }),
+            target_device_id: None,
         },
     )
     .await;
@@ -479,6 +484,7 @@ async fn rejected_message_does_not_poison_outbox_or_disconnect_client() {
         &ClientFrame::Message {
             message_id: "conflict-id".to_string(),
             payload: json!({ "valid": 1 }),
+            target_device_id: None,
         },
     )
     .await;
@@ -493,10 +499,12 @@ async fn rejected_message_does_not_poison_outbox_or_disconnect_client() {
         outbox.push(OutboundMessage {
             message_id: "conflict-id".to_string(),
             payload: json!({ "different": 2 }),
+            target_device_id: None,
         });
         outbox.push(OutboundMessage {
             message_id: "good-msg".to_string(),
             payload: json!({ "good": true }),
+            target_device_id: None,
         });
     }
 

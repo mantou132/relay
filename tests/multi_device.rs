@@ -109,6 +109,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
         &ClientFrame::Message {
             message_id: "m-1".to_string(),
             payload: json!({ "content": "broadcast_to_both" }),
+            target_device_id: None,
         },
     )
     .await
@@ -156,6 +157,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
         &ClientFrame::Message {
             message_id: "m-2".to_string(),
             payload: json!({ "content": "offline_for_b" }),
+            target_device_id: None,
         },
     )
     .await
@@ -203,6 +205,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
         &ClientFrame::Message {
             message_id: "m-3".to_string(),
             payload: json!({ "content": "seamless_continuation" }),
+            target_device_id: None,
         },
     )
     .await
@@ -261,6 +264,7 @@ async fn same_device_reconnection_preempts_old_socket() {
         &ClientFrame::Message {
             message_id: "preempt-1".to_string(),
             payload: json!({ "live": true }),
+            target_device_id: None,
         },
     )
     .await
@@ -307,4 +311,128 @@ async fn health_check_http_endpoint() {
     }
     assert!(response.starts_with("HTTP/1.1 200 OK"), "health check failed: {response}");
     assert!(response.contains("OK"));
+}
+
+#[tokio::test]
+async fn multi_device_targeted_routing_and_offline_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _server = RelayServer::spawn(port, &database);
+
+    // 1. Phone A and Phone B connect to Endpoint 2
+    let mut phone_a = connect_device(port, "pair-target", Endpoint::Two, "phone_a").await;
+    expect_ready(&mut phone_a, Endpoint::Two).await;
+
+    let mut phone_b = connect_device(port, "pair-target", Endpoint::Two, "phone_b").await;
+    expect_ready(&mut phone_b, Endpoint::Two).await;
+
+    // 2. Desktop connects to Endpoint 1
+    let mut desktop = connect_device(port, "pair-target", Endpoint::One, "desktop").await;
+    expect_ready(&mut desktop, Endpoint::One).await;
+
+    // 3. Desktop sends a targeted message to Phone A only
+    send(
+        &mut desktop,
+        &ClientFrame::Message {
+            message_id: "m-target-a".to_string(),
+            payload: json!({ "msg": "only_for_a" }),
+            target_device_id: Some("phone_a".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        receive(&mut desktop).await,
+        ServerFrame::Stored {
+            message_id: "m-target-a".to_string(),
+        }
+    );
+
+    // Phone A receives the message in real-time
+    let frame_a = receive(&mut phone_a).await;
+    assert_eq!(
+        frame_a,
+        ServerFrame::Message {
+            message_id: "m-target-a".to_string(),
+            sequence: 1,
+            payload: json!({ "msg": "only_for_a" }),
+        }
+    );
+    send(&mut phone_a, &ClientFrame::Ack { sequence: 1 }).await.unwrap();
+
+    // Phone B must NOT receive this message!
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Send a message targeted to Phone B to verify Phone B receives its own message next (no m-target-a received by B)
+    send(
+        &mut desktop,
+        &ClientFrame::Message {
+            message_id: "m-target-b".to_string(),
+            payload: json!({ "msg": "only_for_b" }),
+            target_device_id: Some("phone_b".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut desktop).await,
+        ServerFrame::Stored {
+            message_id: "m-target-b".to_string(),
+        }
+    );
+
+    let frame_b = receive(&mut phone_b).await;
+    assert_eq!(
+        frame_b,
+        ServerFrame::Message {
+            message_id: "m-target-b".to_string(),
+            sequence: 2,
+            payload: json!({ "msg": "only_for_b" }),
+        }
+    );
+    send(&mut phone_b, &ClientFrame::Ack { sequence: 2 }).await.unwrap();
+
+    // 4. Now simulate Phone A going offline
+    phone_a.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 5. Desktop sends message targeted to Phone A while Phone A is offline
+    send(
+        &mut desktop,
+        &ClientFrame::Message {
+            message_id: "m-target-a-offline".to_string(),
+            payload: json!({ "msg": "offline_for_a" }),
+            target_device_id: Some("phone_a".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut desktop).await,
+        ServerFrame::Stored {
+            message_id: "m-target-a-offline".to_string(),
+        }
+    );
+
+    // Phone B is online and must NOT receive it
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 6. Phone A reconnects! Phone A should receive its missed targeted message!
+    let mut phone_a_reconnected = connect_device(port, "pair-target", Endpoint::Two, "phone_a").await;
+    expect_ready(&mut phone_a_reconnected, Endpoint::Two).await;
+
+    assert_eq!(
+        receive(&mut phone_a_reconnected).await,
+        ServerFrame::Message {
+            message_id: "m-target-a-offline".to_string(),
+            sequence: 3,
+            payload: json!({ "msg": "offline_for_a" }),
+        }
+    );
+    send(&mut phone_a_reconnected, &ClientFrame::Ack { sequence: 3 }).await.unwrap();
 }

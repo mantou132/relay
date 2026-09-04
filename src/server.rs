@@ -270,12 +270,19 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
             ClientFrame::Message {
                 message_id,
                 payload,
+                target_device_id,
             } => {
-                debug!(%message_id, payload = %payload, "message received");
+                debug!(%message_id, ?target_device_id, payload = %payload, "message received");
                 let _delivery = state.delivery.lock(&query.id).await;
                 match state
                     .database
-                    .store(&query.id, query.endpoint, &message_id, &payload)
+                    .store(
+                        &query.id,
+                        query.endpoint,
+                        &message_id,
+                        &payload,
+                        target_device_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(stored) => {
@@ -286,6 +293,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                             state.hub.send_to_endpoint(
                                 &query.id,
                                 query.endpoint.opposite(),
+                                target_device_id.as_deref(),
                                 pending.into_frame(),
                             );
                         }

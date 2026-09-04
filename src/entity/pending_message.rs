@@ -14,6 +14,7 @@ pub struct Model {
     pub payload_bytes: i64,
     #[sea_orm(indexed)]
     pub created_at: i64,
+    pub target_device_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

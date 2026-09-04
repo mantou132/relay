@@ -22,6 +22,7 @@ export type RelayConnectionState =
 export type OutboundMessage = {
   messageId: string;
   payload: unknown;
+  targetDeviceId?: string;
 };
 
 export type ServerFrame =
@@ -32,7 +33,7 @@ export type ServerFrame =
   | { type: 'error'; message: string };
 
 export type ClientFrame =
-  | { type: 'message'; message_id: string; payload: unknown }
+  | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string }
   | { type: 'ack'; sequence: number };
 
 /** Persistence for outbound messages and the receive cursor. */
@@ -253,8 +254,8 @@ export class RelayClient {
     this.#onDisconnect?.(new Error('Relay 连接已关闭'));
   };
 
-  send = async (payload: unknown) => {
-    const message: OutboundMessage = { messageId: crypto.randomUUID(), payload };
+  send = async (payload: unknown, targetDeviceId?: string) => {
+    const message: OutboundMessage = { messageId: crypto.randomUUID(), payload, targetDeviceId };
     await this.#store.enqueue(message);
     this.#flushOutbox();
   };
@@ -340,7 +341,12 @@ export class RelayClient {
     if (!this.#relayReady || this.#socket?.readyState !== WebSocket.OPEN) return;
     for (const message of await this.#store.outbox()) {
       if (this.#sent.has(message.messageId)) continue;
-      this.#sendFrame({ type: 'message', message_id: message.messageId, payload: message.payload });
+      this.#sendFrame({
+        type: 'message',
+        message_id: message.messageId,
+        payload: message.payload,
+        ...(message.targetDeviceId ? { target_device_id: message.targetDeviceId } : {}),
+      });
       this.#sent.add(message.messageId);
     }
   };

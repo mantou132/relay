@@ -15,7 +15,19 @@ use crate::OutboundMessage;
 pub trait OutboxStore: Send + Sync + 'static {
     /// Persists a new outbound message and returns its generated id. Ids must
     /// be unique across process restarts (UUID v4 works well).
-    async fn enqueue(&self, payload: Value) -> Result<String>;
+    async fn enqueue(&self, payload: Value) -> Result<String> {
+        self.enqueue_targeted(payload, None).await
+    }
+
+    /// Persists a new outbound message with an optional target device id.
+    async fn enqueue_targeted(
+        &self,
+        payload: Value,
+        target_device_id: Option<String>,
+    ) -> Result<String> {
+        let _ = target_device_id;
+        self.enqueue(payload).await
+    }
 
     /// Returns all messages that have not yet been confirmed `stored`.
     async fn outbox(&self) -> Vec<OutboundMessage>;

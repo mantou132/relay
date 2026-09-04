@@ -38,6 +38,8 @@ pub enum ClientFrame {
     Message {
         message_id: String,
         payload: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_device_id: Option<String>,
     },
     /// Cumulative acknowledgement for all received sequences up to this one.
     Ack {

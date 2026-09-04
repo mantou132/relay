@@ -65,14 +65,29 @@ impl Hub {
         token
     }
 
-    /// Broadcasts a server frame to all active devices of the specified endpoint in O(devices on endpoint).
-    pub(crate) fn send_to_endpoint(&self, relay_id: &str, endpoint: Endpoint, frame: ServerFrame) {
+    /// Broadcasts a server frame to all active devices of the specified endpoint,
+    /// or only to the specified target device if `target_device_id` is provided.
+    pub(crate) fn send_to_endpoint(
+        &self,
+        relay_id: &str,
+        endpoint: Endpoint,
+        target_device_id: Option<&str>,
+        frame: ServerFrame,
+    ) {
         let matching: Vec<_> = {
             let connections = self.connections.lock().expect("hub lock poisoned");
-            connections
-                .get(&(relay_id.to_string(), endpoint))
-                .map(|devices| devices.values().map(|conn| conn.tx.clone()).collect())
-                .unwrap_or_default()
+            if let Some(devices) = connections.get(&(relay_id.to_string(), endpoint)) {
+                if let Some(target) = target_device_id {
+                    devices
+                        .get(target)
+                        .map(|conn| vec![conn.tx.clone()])
+                        .unwrap_or_default()
+                } else {
+                    devices.values().map(|conn| conn.tx.clone()).collect()
+                }
+            } else {
+                Vec::new()
+            }
         };
         for tx in matching {
             let _ = tx.send(frame.clone());
@@ -135,11 +150,11 @@ mod tests {
         assert!(matches!(rx2.recv().await, Some(ServerFrame::Ready { .. })));
         assert!(matches!(rx3.recv().await, Some(ServerFrame::Ready { .. })));
 
-        // Send to (pair-1, Endpoint::Two)
+        // Send broadcast to (pair-1, Endpoint::Two)
         let test_frame = ServerFrame::Stored {
             message_id: "test-stored".to_string(),
         };
-        hub.send_to_endpoint("pair-1", Endpoint::Two, test_frame.clone());
+        hub.send_to_endpoint("pair-1", Endpoint::Two, None, test_frame.clone());
 
         // dev2 must receive the frame
         assert_eq!(rx2.recv().await, Some(test_frame));
@@ -147,6 +162,22 @@ mod tests {
         // dev1 and dev3 must NOT receive the frame
         assert!(rx1.try_recv().is_err());
         assert!(rx3.try_recv().is_err());
+
+        // Register dev4 also on (pair-1, Endpoint::Two)
+        let (tx4, mut rx4) = mpsc::unbounded_channel();
+        let _t4 = hub.register("pair-1", Endpoint::Two, "dev4", tx4, Vec::new());
+        assert!(matches!(rx4.recv().await, Some(ServerFrame::Ready { .. })));
+
+        // Send targeted to dev4 only
+        let targeted_frame = ServerFrame::Stored {
+            message_id: "test-targeted".to_string(),
+        };
+        hub.send_to_endpoint("pair-1", Endpoint::Two, Some("dev4"), targeted_frame.clone());
+
+        // dev4 receives it
+        assert_eq!(rx4.recv().await, Some(targeted_frame));
+        // dev2 does NOT receive it!
+        assert!(rx2.try_recv().is_err());
     }
 
     #[tokio::test]

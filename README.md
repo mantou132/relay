@@ -72,12 +72,13 @@ Query parameters for `/ws`:
 Messages are isolated by pairing id and forwarded to the opposite endpoint with
 the same id:
 
-- **Multi-Device Support**: Multiple devices with distinct `device_id`s can connect
+- **Multi-Device Support & Targeted Routing**: Multiple devices with distinct `device_id`s can connect
   to the same endpoint simultaneously without conflicts. Inbound messages destined
-  for that endpoint are broadcast in real-time to all currently active devices. Each
-  device maintains its own durable acknowledgment cursor; pending messages remain
-  available for offline devices and are purged only after all registered devices of
-  that endpoint have acknowledged them (or when the message retention period expires).
+  for that endpoint are broadcast in real-time to all currently active devices by default.
+  Alternatively, messages can specify an optional `target_device_id` to route exclusively to
+  a single designated device. Each device maintains its own durable acknowledgment cursor;
+  broadcast messages are purged only after all registered devices have acknowledged them,
+  while targeted messages are purged as soon as their designated target device acknowledges them.
 - **Device Lifecycle & Inactivity Cutoff**: Inactive devices that have not connected
   within `--device-retention-secs` (default: 7 days) are automatically excluded from
   acknowledgment cursor calculations, preventing abandoned devices from permanently
@@ -118,6 +119,7 @@ Client to server:
 
 ```json
 {"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"}}
+{"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"},"target_device_id":"phone_a"}
 {"type":"ack","sequence":42}
 ```
 
@@ -132,7 +134,9 @@ Server to client:
 ```
 
 `payload` may be any JSON value. `message_id` must be non-empty, stable across
-retries, and no longer than 256 bytes. WebSocket messages are limited to 10 MiB.
+retries, and no longer than 256 bytes. `target_device_id` is an optional string
+specifying a target device on the opposite endpoint; if omitted, the message
+is broadcast to all active devices on that endpoint. WebSocket messages are limited to 10 MiB.
 
 ## Reliable delivery
 
@@ -146,7 +150,10 @@ Delivery is at-least-once across endpoint disconnects and relay restarts:
    committed to SQLite.
 4. The receiver processes messages in `sequence` order, durably records its
    cumulative receive cursor, and only then sends `ack`.
-5. The relay deletes acknowledged pending deliveries. Unacknowledged messages
+5. The relay deletes acknowledged pending deliveries. Broadcast messages are purged
+   once acknowledged by all active devices on that endpoint (or when expired). Targeted
+   messages are purged as soon as the designated target device acknowledges them.
+   Unacknowledged messages matching the connecting device (broadcast or targeted to it)
    are replayed in sequence order after reconnect or process restart.
 6. If a sender retries a previously stored `message_id`, the relay returns
    `stored` without assigning a second sequence. Receivers must still tolerate
@@ -228,8 +235,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Send a message (queued to outbox and sent to opposite endpoint)
+    // Broadcast a message (queued to outbox and sent to all devices on opposite endpoint)
     let message_id = client.send(json!({ "hello": "world" })).await?;
+
+    // Or send a targeted message to a specific device on opposite endpoint
+    let targeted_id = client
+        .send_targeted(json!({ "hello": "phone" }), Some("phone_a".to_string()))
+        .await?;
 
     // Close client when done (disconnects and exits run loop)
     // client.close();
@@ -265,8 +277,11 @@ const client = new RelayClient({
 // Connect to the relay
 await client.connect();
 
-// Send payload to opposite endpoint
+// Broadcast payload to all devices on opposite endpoint
 await client.send({ text: 'Hello from phone' });
+
+// Or send payload to a specific target device
+await client.send({ text: 'Hello specifically to desktop' }, 'desktop');
 
 // Close connection (stops reconnect loop)
 // client.close();

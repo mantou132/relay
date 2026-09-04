@@ -25,9 +25,10 @@ const CLEANUP_DELETE_BATCH_SIZE: usize = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredMessage {
-    message_id: String,
-    sequence: u64,
-    payload: Value,
+    pub(crate) message_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) payload: Value,
+    pub(crate) target_device_id: Option<String>,
 }
 
 impl StoredMessage {
@@ -96,8 +97,12 @@ impl Database {
         source: Endpoint,
         message_id: &str,
         payload: &Value,
+        target_device_id: Option<&str>,
     ) -> Result<StoreResult> {
         validate_message_id(message_id)?;
+        if let Some(target) = target_device_id {
+            validate_target_device_id(target)?;
+        }
         let destination = source.opposite().to_string();
         let source = source.to_string();
         let payload_bytes =
@@ -183,6 +188,7 @@ impl Database {
                 payload: Set(payload.clone()),
                 payload_bytes: Set(payload_bytes),
                 created_at: Set(now),
+                target_device_id: Set(target_device_id.map(str::to_string)),
             }
             .insert(&transaction)
             .await?;
@@ -273,6 +279,11 @@ impl Database {
             .filter(pending_message::Column::RelayId.eq(relay_id))
             .filter(pending_message::Column::Destination.eq(destination.to_string()))
             .filter(pending_message::Column::Sequence.gt(last_acked))
+            .filter(
+                Condition::any()
+                    .add(pending_message::Column::TargetDeviceId.is_null())
+                    .add(pending_message::Column::TargetDeviceId.eq(device_id)),
+            )
             .order_by_asc(pending_message::Column::Sequence)
             .all(&self.connection)
             .await?
@@ -336,10 +347,25 @@ impl Database {
             .min()
             .unwrap_or(sequence);
 
+        let delete_condition = Condition::all()
+            .add(pending_message::Column::RelayId.eq(relay_id))
+            .add(pending_message::Column::Destination.eq(destination.to_string()))
+            .add(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(pending_message::Column::TargetDeviceId.is_null())
+                            .add(pending_message::Column::Sequence.lte(min_acked)),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(pending_message::Column::TargetDeviceId.eq(device_id))
+                            .add(pending_message::Column::Sequence.lte(sequence)),
+                    ),
+            );
+
         let result = pending_message::Entity::delete_many()
-            .filter(pending_message::Column::RelayId.eq(relay_id))
-            .filter(pending_message::Column::Destination.eq(destination.to_string()))
-            .filter(pending_message::Column::Sequence.lte(min_acked))
+            .filter(delete_condition)
             .exec(&transaction)
             .await?;
 
@@ -403,10 +429,25 @@ impl Database {
             .min()
             .unwrap_or(head);
 
+        let delete_condition = Condition::all()
+            .add(pending_message::Column::RelayId.eq(relay_id))
+            .add(pending_message::Column::Destination.eq(destination.to_string()))
+            .add(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(pending_message::Column::TargetDeviceId.is_null())
+                            .add(pending_message::Column::Sequence.lte(min_acked)),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(pending_message::Column::TargetDeviceId.eq(device_id))
+                            .add(pending_message::Column::Sequence.lte(head)),
+                    ),
+            );
+
         let result = pending_message::Entity::delete_many()
-            .filter(pending_message::Column::RelayId.eq(relay_id))
-            .filter(pending_message::Column::Destination.eq(destination.to_string()))
-            .filter(pending_message::Column::Sequence.lte(min_acked))
+            .filter(delete_condition)
             .exec(&transaction)
             .await?;
 
@@ -510,6 +551,11 @@ async fn initialize_schema(connection: &DatabaseConnection) -> Result<()> {
         index.if_not_exists();
         connection.execute(&index).await?;
     }
+
+    let _ = connection
+        .execute_unprepared("ALTER TABLE pending_messages ADD COLUMN target_device_id TEXT")
+        .await;
+
     Ok(())
 }
 
@@ -529,6 +575,7 @@ impl TryFrom<pending_message::Model> for StoredMessage {
             message_id: model.message_id,
             sequence: u64::try_from(model.sequence).context("stored sequence is negative")?,
             payload: model.payload,
+            target_device_id: model.target_device_id,
         })
     }
 }
@@ -536,6 +583,12 @@ impl TryFrom<pending_message::Model> for StoredMessage {
 fn validate_message_id(message_id: &str) -> Result<()> {
     anyhow::ensure!(!message_id.is_empty(), "message_id must not be empty");
     anyhow::ensure!(message_id.len() <= MAX_ID_BYTES, "message_id is too long");
+    Ok(())
+}
+
+fn validate_target_device_id(device_id: &str) -> Result<()> {
+    anyhow::ensure!(!device_id.is_empty(), "target_device_id must not be empty");
+    anyhow::ensure!(device_id.len() <= MAX_ID_BYTES, "target_device_id is too long");
     Ok(())
 }
 
@@ -561,7 +614,7 @@ mod tests {
         let (_directory, database) = database().await;
         let payload = serde_json::json!({ "opaque": [1, 2, 3] });
         let stored = database
-            .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .store("pair-a", Endpoint::One, "endpoint1-1", &payload, None)
             .await
             .unwrap();
         assert_eq!(stored.pending.as_ref().unwrap().sequence, 1);
@@ -595,7 +648,7 @@ mod tests {
         let (_directory, database) = database().await;
         let payload = serde_json::json!({ "request": "once" });
         database
-            .store("pair-a", Endpoint::Two, "endpoint2-1", &payload)
+            .store("pair-a", Endpoint::Two, "endpoint2-1", &payload, None)
             .await
             .unwrap();
         database
@@ -604,7 +657,7 @@ mod tests {
             .unwrap();
 
         let duplicate = database
-            .store("pair-a", Endpoint::Two, "endpoint2-1", &payload)
+            .store("pair-a", Endpoint::Two, "endpoint2-1", &payload, None)
             .await
             .unwrap();
         assert!(duplicate.pending.is_none());
@@ -621,11 +674,11 @@ mod tests {
     async fn relay_ids_and_directions_are_isolated() {
         let (_directory, database) = database().await;
         database
-            .store("pair-a", Endpoint::One, "one", &serde_json::json!(1))
+            .store("pair-a", Endpoint::One, "one", &serde_json::json!(1), None)
             .await
             .unwrap();
         database
-            .store("pair-b", Endpoint::Two, "one", &serde_json::json!(2))
+            .store("pair-b", Endpoint::Two, "one", &serde_json::json!(2), None)
             .await
             .unwrap();
 
@@ -671,25 +724,25 @@ mod tests {
         let (_directory, database) = database_with_limits(limits).await;
         let payload = serde_json::json!({ "request": 1 });
         database
-            .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .store("pair-a", Endpoint::One, "endpoint1-1", &payload, None)
             .await
             .unwrap();
 
         let error = database
-            .store("pair-a", Endpoint::One, "endpoint1-2", &payload)
+            .store("pair-a", Endpoint::One, "endpoint1-2", &payload, None)
             .await
             .unwrap_err();
         assert!(error.to_string().starts_with("queue_full:"));
 
         // A retry remains idempotent even while the queue is full.
         database
-            .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .store("pair-a", Endpoint::One, "endpoint1-1", &payload, None)
             .await
             .unwrap();
 
         let oversized = serde_json::json!("x".repeat(1024));
         let error = database
-            .store("pair-b", Endpoint::One, "endpoint1-1", &oversized)
+            .store("pair-b", Endpoint::One, "endpoint1-1", &oversized, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("payload byte limit"));
@@ -705,7 +758,7 @@ mod tests {
         let (_directory, database) = database_with_limits(limits).await;
         let payload = serde_json::json!({ "request": 1 });
         database
-            .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .store("pair-a", Endpoint::One, "endpoint1-1", &payload, None)
             .await
             .unwrap();
         pending_message::Entity::update_many()
@@ -731,7 +784,7 @@ mod tests {
         );
 
         let retried = database
-            .store("pair-a", Endpoint::One, "endpoint1-1", &payload)
+            .store("pair-a", Endpoint::One, "endpoint1-1", &payload, None)
             .await
             .unwrap();
         assert_eq!(retried.pending.unwrap().sequence, 2);
@@ -756,15 +809,15 @@ mod tests {
 
         // Store 3 messages destined for Endpoint::Two
         database
-            .store("pair-m", Endpoint::One, "msg-1", &serde_json::json!("first"))
+            .store("pair-m", Endpoint::One, "msg-1", &serde_json::json!("first"), None)
             .await
             .unwrap();
         database
-            .store("pair-m", Endpoint::One, "msg-2", &serde_json::json!("second"))
+            .store("pair-m", Endpoint::One, "msg-2", &serde_json::json!("second"), None)
             .await
             .unwrap();
         database
-            .store("pair-m", Endpoint::One, "msg-3", &serde_json::json!("third"))
+            .store("pair-m", Endpoint::One, "msg-3", &serde_json::json!("third"), None)
             .await
             .unwrap();
 
@@ -861,15 +914,15 @@ mod tests {
             .unwrap();
 
         database
-            .store("pair-h", Endpoint::One, "msg-1", &serde_json::json!("1"))
+            .store("pair-h", Endpoint::One, "msg-1", &serde_json::json!("1"), None)
             .await
             .unwrap();
         database
-            .store("pair-h", Endpoint::One, "msg-2", &serde_json::json!("2"))
+            .store("pair-h", Endpoint::One, "msg-2", &serde_json::json!("2"), None)
             .await
             .unwrap();
         database
-            .store("pair-h", Endpoint::One, "msg-3", &serde_json::json!("3"))
+            .store("pair-h", Endpoint::One, "msg-3", &serde_json::json!("3"), None)
             .await
             .unwrap();
 
@@ -919,7 +972,7 @@ mod tests {
 
         // Subsequent message arrives with sequence 4
         database
-            .store("pair-h", Endpoint::One, "msg-4", &serde_json::json!("4"))
+            .store("pair-h", Endpoint::One, "msg-4", &serde_json::json!("4"), None)
             .await
             .unwrap();
 
@@ -955,7 +1008,7 @@ mod tests {
 
         // When a single device connects with acknowledge_head and no other devices exist:
         database
-            .store("pair-single", Endpoint::One, "s-1", &serde_json::json!("s1"))
+            .store("pair-single", Endpoint::One, "s-1", &serde_json::json!("s1"), None)
             .await
             .unwrap();
         let deleted = database
@@ -966,6 +1019,98 @@ mod tests {
         assert!(
             database
                 .pending_for_device("pair-single", Endpoint::Two, "solo_device")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_device_targeted_messages_and_selective_purging() {
+        let (_directory, database) = database().await;
+
+        database
+            .register_device("pair-target", Endpoint::Two, "phone_a")
+            .await
+            .unwrap();
+        database
+            .register_device("pair-target", Endpoint::Two, "phone_b")
+            .await
+            .unwrap();
+
+        // Broadcast message (seq 1)
+        database
+            .store("pair-target", Endpoint::One, "m1", &serde_json::json!("all"), None)
+            .await
+            .unwrap();
+
+        // Targeted to phone_a (seq 2)
+        database
+            .store("pair-target", Endpoint::One, "m2", &serde_json::json!("for_a"), Some("phone_a"))
+            .await
+            .unwrap();
+
+        // Targeted to phone_b (seq 3)
+        database
+            .store("pair-target", Endpoint::One, "m3", &serde_json::json!("for_b"), Some("phone_b"))
+            .await
+            .unwrap();
+
+        // phone_a sees m1 and m2, but NOT m3!
+        let pending_a = database
+            .pending_for_device("pair-target", Endpoint::Two, "phone_a")
+            .await
+            .unwrap();
+        assert_eq!(pending_a.len(), 2);
+        assert_eq!(pending_a[0].message_id, "m1");
+        assert_eq!(pending_a[1].message_id, "m2");
+
+        // phone_b sees m1 and m3, but NOT m2!
+        let pending_b = database
+            .pending_for_device("pair-target", Endpoint::Two, "phone_b")
+            .await
+            .unwrap();
+        assert_eq!(pending_b.len(), 2);
+        assert_eq!(pending_b[0].message_id, "m1");
+        assert_eq!(pending_b[1].message_id, "m3");
+
+        // phone_a acknowledges up to sequence 2
+        // Since phone_b is still at 0, broadcast m1 is NOT deleted (min_acked = 0).
+        // But m2 was targeted specifically to phone_a, so m2 IS deleted!
+        let deleted = database
+            .acknowledge("pair-target", Endpoint::Two, "phone_a", 2)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1); // m2 deleted!
+
+        // phone_b STILL has m1 and m3
+        let pending_b = database
+            .pending_for_device("pair-target", Endpoint::Two, "phone_b")
+            .await
+            .unwrap();
+        assert_eq!(pending_b.len(), 2);
+
+        // phone_a now has 0 pending
+        let pending_a = database
+            .pending_for_device("pair-target", Endpoint::Two, "phone_a")
+            .await
+            .unwrap();
+        assert!(pending_a.is_empty());
+
+        // Now phone_b acknowledges sequence 3
+        // phone_a is at 2, phone_b is at 3, min_acked is 2.
+        // Broadcast m1 (seq 1 <= min_acked 2) is deleted!
+        // Targeted m3 (seq 3 <= phone_b ack 3) is deleted!
+        let deleted = database
+            .acknowledge("pair-target", Endpoint::Two, "phone_b", 3)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2); // m1 and m3 deleted!
+
+        // Queue is completely empty now
+        assert!(
+            database
+                .pending("pair-target", Endpoint::Two)
                 .await
                 .unwrap()
                 .is_empty()
@@ -990,7 +1135,7 @@ mod tests {
             .unwrap();
 
         database
-            .store("pair-t", Endpoint::One, "m1", &serde_json::json!("1"))
+            .store("pair-t", Endpoint::One, "m1", &serde_json::json!("1"), None)
             .await
             .unwrap();
 

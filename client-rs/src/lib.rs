@@ -35,6 +35,7 @@ pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 pub struct OutboundMessage {
     pub message_id: String,
     pub payload: Value,
+    pub target_device_id: Option<String>,
 }
 
 /// Callbacks invoked as the connection progresses.
@@ -114,7 +115,17 @@ where
     /// Enqueues a message into the store and notifies the connection loop to
     /// flush outbound frames immediately. Returns the generated message id.
     pub async fn send(&self, payload: Value) -> anyhow::Result<String> {
-        let message_id = self.store.enqueue(payload).await?;
+        self.send_targeted(payload, None).await
+    }
+
+    /// Enqueues a message with an optional target device id into the store and
+    /// notifies the connection loop to flush outbound frames immediately.
+    pub async fn send_targeted(
+        &self,
+        payload: Value,
+        target_device_id: Option<String>,
+    ) -> anyhow::Result<String> {
+        let message_id = self.store.enqueue_targeted(payload, target_device_id).await?;
         self.notify_send.notify_one();
         Ok(message_id)
     }
@@ -265,6 +276,7 @@ where
                     .send_frame(&relay_frame::ClientFrame::Message {
                         message_id: message.message_id,
                         payload: message.payload,
+                        target_device_id: message.target_device_id,
                     })
                     .await?;
             }
@@ -303,6 +315,8 @@ pub mod relay_frame {
         Message {
             message_id: String,
             payload: Value,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            target_device_id: Option<String>,
         },
         /// Cumulative acknowledgement for all received sequences up to this one.
         Ack {
@@ -366,10 +380,19 @@ pub mod memory {
     #[async_trait::async_trait]
     impl OutboxStore for MemoryStore {
         async fn enqueue(&self, payload: Value) -> Result<String> {
+            self.enqueue_targeted(payload, None).await
+        }
+
+        async fn enqueue_targeted(
+            &self,
+            payload: Value,
+            target_device_id: Option<String>,
+        ) -> Result<String> {
             let message_id = Uuid::new_v4().to_string();
             self.state.lock().await.outbox.push(OutboundMessage {
                 message_id: message_id.clone(),
                 payload,
+                target_device_id,
             });
             Ok(message_id)
         }
@@ -428,6 +451,23 @@ mod tests {
         let res = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
         assert!(res.is_ok(), "client.run() should exit promptly after close()");
         assert!(res.unwrap().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_send_targeted_enqueues_target_device_id() {
+        let store = Arc::new(MemoryStore::new());
+        let handler = Arc::new(DummyHandler);
+        let client = Client::new("ws://127.0.0.1:9".to_string(), store.clone(), handler);
+
+        let msg_id = client
+            .send_targeted(serde_json::json!({ "test": 1 }), Some("phone_x".to_string()))
+            .await
+            .unwrap();
+
+        let outbox = store.outbox().await;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].message_id, msg_id);
+        assert_eq!(outbox[0].target_device_id, Some("phone_x".to_string()));
     }
 }
 
