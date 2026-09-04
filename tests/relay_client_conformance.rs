@@ -118,10 +118,15 @@ impl OutboxStore for TestStore {
 
 #[derive(Default)]
 struct CollectHandler {
+    connected: std::sync::atomic::AtomicBool,
     payloads: std::sync::Mutex<Vec<Value>>,
 }
 
 impl ClientHandler for CollectHandler {
+    fn on_connected(&self) {
+        self.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn on_payload(&self, payload: Value) {
         // The handler runs on the client task; a std mutex held only for a
         // push is fine and never blocks across an await.
@@ -374,3 +379,70 @@ async fn sends_live_messages_while_connected_and_removes_on_stored() {
     .await;
     run_task.abort();
 }
+
+#[tokio::test]
+async fn ack_head_client_purges_backlog_and_receives_live_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let _server = RelayServer::spawn(port, &directory.path().join("relay.sqlite3"));
+
+    // Raw endpoint 1 sends 2 messages to endpoint 2 while endpoint 2 is offline
+    let mut endpoint_one = raw_connect(port, "pair-ack-client", "1").await;
+    send_client_frame(
+        &mut endpoint_one,
+        &ClientFrame::Message {
+            message_id: "m-1".to_string(),
+            payload: json!({ "old": 1 }),
+        },
+    )
+    .await;
+    let _ = read_until(&mut endpoint_one, |f| matches!(f, ServerFrame::Stored { .. })).await;
+
+    send_client_frame(
+        &mut endpoint_one,
+        &ClientFrame::Message {
+            message_id: "m-2".to_string(),
+            payload: json!({ "old": 2 }),
+        },
+    )
+    .await;
+    let _ = read_until(&mut endpoint_one, |f| matches!(f, ServerFrame::Stored { .. })).await;
+
+    // Start client for endpoint 2 with ack_head = true
+    let store = Arc::new(TestStore::default());
+    let handler = Arc::new(CollectHandler::default());
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-ack-client&endpoint=2&device_id=c2");
+    let client = Client::new_with_ack_head(url, true, store.clone(), handler.clone());
+    let run_task = tokio::spawn(client.into_task());
+
+    // Wait until connected
+    wait_until(
+        || handler.connected.load(std::sync::atomic::Ordering::Relaxed),
+        "client connected",
+    )
+    .await;
+
+    // Now endpoint 1 sends live message 3
+    send_client_frame(
+        &mut endpoint_one,
+        &ClientFrame::Message {
+            message_id: "m-3".to_string(),
+            payload: json!({ "live": 3 }),
+        },
+    )
+    .await;
+    let _ = read_until(&mut endpoint_one, |f| matches!(f, ServerFrame::Stored { .. })).await;
+
+    // Handler should receive ONLY live message 3; old 1 and 2 were dropped
+    wait_until(
+        || !handler.payloads.lock().unwrap().is_empty(),
+        "live payload received",
+    )
+    .await;
+
+    let payloads = handler.payloads.lock().unwrap().clone();
+    assert_eq!(payloads, vec![json!({ "live": 3 })]);
+
+    run_task.abort();
+}
+

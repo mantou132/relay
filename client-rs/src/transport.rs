@@ -32,6 +32,15 @@ pub fn endpoint_url(
     )
 }
 
+/// Appends `ack_head=true` query parameter to a connect URL.
+pub fn append_ack_head(url: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&ack_head=true")
+    } else {
+        format!("{url}?ack_head=true")
+    }
+}
+
 pub async fn connect(url: &str) -> Result<Transport> {
     let (socket, _) = connect_async(url)
         .await

@@ -51,6 +51,7 @@ pub trait ClientHandler: Send + Sync + 'static {
 
 pub struct Client<S, H> {
     url: Arc<String>,
+    ack_head: Arc<std::sync::atomic::AtomicBool>,
     store: Arc<S>,
     handler: Arc<H>,
     notify_send: Arc<tokio::sync::Notify>,
@@ -60,6 +61,7 @@ impl<S, H> Clone for Client<S, H> {
     fn clone(&self) -> Self {
         Self {
             url: self.url.clone(),
+            ack_head: self.ack_head.clone(),
             store: self.store.clone(),
             handler: self.handler.clone(),
             notify_send: self.notify_send.clone(),
@@ -77,8 +79,18 @@ where
         store: Arc<S>,
         handler: Arc<H>,
     ) -> Self {
+        Self::new_with_ack_head(url, false, store, handler)
+    }
+
+    pub fn new_with_ack_head(
+        url: String,
+        ack_head: bool,
+        store: Arc<S>,
+        handler: Arc<H>,
+    ) -> Self {
         Self {
             url: Arc::new(url),
+            ack_head: Arc::new(std::sync::atomic::AtomicBool::new(ack_head)),
             store,
             handler,
             notify_send: Arc::new(tokio::sync::Notify::new()),
@@ -139,7 +151,14 @@ where
     }
 
     async fn run_connection(&self, was_connected: &mut bool) -> anyhow::Result<()> {
-        let mut transport = transport::connect(&self.url).await?;
+        let should_ack_head = self.ack_head.load(std::sync::atomic::Ordering::Relaxed);
+        let connect_url = if should_ack_head {
+            transport::append_ack_head(&self.url)
+        } else {
+            self.url.as_str().to_string()
+        };
+        let mut transport = transport::connect(&connect_url).await?;
+        self.ack_head.store(false, std::sync::atomic::Ordering::Relaxed);
         self.handler.on_connected();
         *was_connected = true;
 

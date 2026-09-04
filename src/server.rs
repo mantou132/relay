@@ -43,6 +43,42 @@ struct ConnectQuery {
     id: String,
     endpoint: Endpoint,
     device_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    ack_head: bool,
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct BoolVisitor;
+
+    impl<'de> Visitor<'de> for BoolVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean or boolean string")
+        }
+
+        fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            match v.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" | "" => Ok(false),
+                _ => Err(de::Error::custom(format!("invalid boolean: {v}"))),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(BoolVisitor)
 }
 
 async fn websocket_handler(
@@ -102,6 +138,22 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
             )
             .await;
             return;
+        }
+
+        if query.ack_head {
+            if let Err(error) = state
+                .database
+                .acknowledge_head(&query.id, query.endpoint, &query.device_id)
+                .await
+            {
+                error!(%error, "failed to acknowledge head for relay device");
+                reject_socket(
+                    &mut socket,
+                    "relay_storage_unavailable: acknowledge head failed",
+                )
+                .await;
+                return;
+            }
         }
 
         let pending = match state

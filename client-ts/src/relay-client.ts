@@ -56,6 +56,11 @@ export type RelayClientOptions = {
   deviceId?: string;
   /** WebSocket endpoint of the relay, e.g. wss://host/ws. */
   relayUrl: string;
+  /**
+   * If true, the initial connection requests ack_head to align cursors and drop stale server backlog.
+   * Subsequent automatic reconnects will not send ack_head, preserving missed message replay.
+   */
+  ackHead?: boolean;
   onPayload: (payload: unknown) => void | Promise<void>;
   onStateChange?: (state: RelayConnectionState, error?: string) => void;
   onDisconnect?: (error: Error) => void;
@@ -101,61 +106,59 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
   const load = (): StoredState => {
     try {
       const raw = localStorage.getItem(key);
-      const value = raw ? JSON.parse(raw) : null;
-      if (
-        value &&
-        value.relayId === relayId &&
-        Array.isArray(value.outbox)
-      ) {
-        return {
-          relayId,
-          deviceId: typeof value.deviceId === 'string' && value.deviceId.length > 0 ? value.deviceId : crypto.randomUUID(),
-          ...(Number.isSafeInteger(value.lastReceived) ? { lastReceived: value.lastReceived } : {}),
-          outbox: value.outbox.filter(
-            (item: any): item is OutboundMessage =>
-              typeof item?.messageId === 'string' && item.messageId.length > 0 && 'payload' in item,
-          ),
-        };
+      if (!raw) return { relayId, deviceId: crypto.randomUUID(), outbox: [] };
+      const parsed = JSON.parse(raw) as Partial<StoredState>;
+      if (parsed.relayId !== relayId) {
+        return { relayId, deviceId: parsed.deviceId ?? crypto.randomUUID(), outbox: [] };
       }
+      return {
+        relayId,
+        deviceId: parsed.deviceId ?? crypto.randomUUID(),
+        lastReceived: parsed.lastReceived,
+        outbox: Array.isArray(parsed.outbox) ? parsed.outbox : [],
+      };
     } catch {
-      // Corrupt or outdated state is replaced with a fresh outbox; the pairing id is
-      // untouched so the user can still reconnect from settings.
+      return { relayId, deviceId: crypto.randomUUID(), outbox: [] };
     }
-    return {
-      relayId,
-      deviceId: crypto.randomUUID(),
-      outbox: [],
-    };
   };
-  const save = (state: StoredState) => localStorage.setItem(key, JSON.stringify(state));
+
+  const save = (state: StoredState) => {
+    try {
+      localStorage.setItem(key, JSON.stringify(state));
+    } catch {
+      // Quota exceeded or private browsing restrictions
+    }
+  };
+
   return {
     outbox: () => load().outbox,
     enqueue: (message) => {
       const state = load();
-      save({ ...state, outbox: [...state.outbox, message] });
+      state.outbox.push(message);
+      save(state);
     },
     removeFromOutbox: (messageId) => {
       const state = load();
-      save({ ...state, outbox: state.outbox.filter((item) => item.messageId !== messageId) });
+      state.outbox = state.outbox.filter((msg) => msg.messageId !== messageId);
+      save(state);
     },
     lastReceived: () => load().lastReceived,
     markReceived: (sequence) => {
       const state = load();
-      save({ ...state, lastReceived: sequence });
+      state.lastReceived = sequence;
+      save(state);
     },
-    deviceId: () => {
-      const state = load();
-      return state.deviceId;
-    },
+    deviceId: () => load().deviceId,
   };
 };
 
 export class RelayClient {
   readonly relayId: string;
-  readonly #endpoint: '1' | '2';
+  #endpoint: '1' | '2';
   #deviceId?: string;
-  readonly #relayUrl: string;
-  readonly #store: RelayStore;
+  #relayUrl: string;
+  #ackHead: boolean;
+  #store: RelayStore;
   #onPayload: RelayClientOptions['onPayload'];
   #onStateChange?: RelayClientOptions['onStateChange'];
   #onDisconnect?: RelayClientOptions['onDisconnect'];
@@ -173,6 +176,7 @@ export class RelayClient {
     endpoint,
     deviceId,
     relayUrl,
+    ackHead,
     onPayload,
     onStateChange,
     onDisconnect,
@@ -184,13 +188,17 @@ export class RelayClient {
     this.#endpoint = endpoint;
     this.#deviceId = deviceId;
     this.#relayUrl = relayUrl;
+    this.#ackHead = ackHead ?? false;
     this.#store = store ?? localStorageStore(relayId, storageKey);
     this.#onPayload = onPayload;
     this.#onStateChange = onStateChange;
     this.#onDisconnect = onDisconnect;
   }
 
-  connect = async () => {
+  connect = async (options?: { ackHead?: boolean }) => {
+    if (options?.ackHead !== undefined) {
+      this.#ackHead = options.ackHead;
+    }
     if (this.#socket && this.#socket.readyState <= WebSocket.OPEN) return;
     this.#manualClose = false;
     this.#preemptedSeen = false;
@@ -206,6 +214,9 @@ export class RelayClient {
     url.searchParams.set('endpoint', this.#endpoint);
     if (this.#deviceId) {
       url.searchParams.set('device_id', this.#deviceId);
+    }
+    if (this.#ackHead) {
+      url.searchParams.set('ack_head', 'true');
     }
     const socket = new WebSocket(url);
     this.#socket = socket;
@@ -229,6 +240,7 @@ export class RelayClient {
   };
 
   #handleOpen = () => {
+    this.#ackHead = false;
     this.#relayReady = false;
     this.#sent.clear();
   };

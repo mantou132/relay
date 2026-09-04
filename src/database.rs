@@ -344,6 +344,70 @@ impl Database {
         Ok(result.rows_affected)
     }
 
+    pub(crate) async fn acknowledge_head(
+        &self,
+        relay_id: &str,
+        destination: Endpoint,
+        device_id: &str,
+    ) -> Result<u64> {
+        let now = unix_timestamp()?;
+        let transaction = self.connection.begin().await?;
+
+        let counter = counter::Entity::find_by_id((relay_id.to_owned(), destination.to_string()))
+            .one(&transaction)
+            .await?;
+        let head = counter.map_or(0, |c| c.next_sequence);
+
+        let dev = device::Entity::find_by_id((
+            relay_id.to_owned(),
+            destination.to_string(),
+            device_id.to_owned(),
+        ))
+        .one(&transaction)
+        .await?;
+
+        if let Some(dev) = dev {
+            let mut active = dev.into_active_model();
+            active.last_acked_sequence = Set(head);
+            active.last_seen_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            device::ActiveModel {
+                relay_id: Set(relay_id.to_owned()),
+                endpoint: Set(destination.to_string()),
+                device_id: Set(device_id.to_owned()),
+                last_acked_sequence: Set(head),
+                last_seen_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        let all_devices = device::Entity::find()
+            .filter(device::Column::RelayId.eq(relay_id))
+            .filter(device::Column::Endpoint.eq(destination.to_string()))
+            .all(&transaction)
+            .await?;
+
+        for d in all_devices {
+            if d.last_acked_sequence < head {
+                let mut active = d.into_active_model();
+                active.last_acked_sequence = Set(head);
+                active.update(&transaction).await?;
+            }
+        }
+
+        let result = pending_message::Entity::delete_many()
+            .filter(pending_message::Column::RelayId.eq(relay_id))
+            .filter(pending_message::Column::Destination.eq(destination.to_string()))
+            .filter(pending_message::Column::Sequence.lte(head))
+            .exec(&transaction)
+            .await?;
+
+        transaction.commit().await?;
+        Ok(result.rows_affected)
+    }
+
     pub(crate) async fn cleanup(&self) -> Result<CleanupStats> {
         let now = unix_timestamp()?;
         let pending_cutoff = now.saturating_sub(self.limits.pending_retention_secs);
@@ -779,4 +843,94 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[tokio::test]
+    async fn acknowledge_head_clears_all_pending_and_advances_cursors() {
+        let (_directory, database) = database().await;
+
+        database
+            .register_device("pair-h", Endpoint::Two, "stale_phone")
+            .await
+            .unwrap();
+
+        database
+            .store("pair-h", Endpoint::One, "msg-1", &serde_json::json!("1"))
+            .await
+            .unwrap();
+        database
+            .store("pair-h", Endpoint::One, "msg-2", &serde_json::json!("2"))
+            .await
+            .unwrap();
+        database
+            .store("pair-h", Endpoint::One, "msg-3", &serde_json::json!("3"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .pending_for_device("pair-h", Endpoint::Two, "stale_phone")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // A new device connects fresh with acknowledge_head
+        let deleted = database
+            .acknowledge_head("pair-h", Endpoint::Two, "fresh_phone")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 3);
+
+        // Fresh phone gets 0 pending messages
+        assert!(
+            database
+                .pending_for_device("pair-h", Endpoint::Two, "fresh_phone")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Stale phone also gets 0 pending messages (messages were deleted)
+        assert!(
+            database
+                .pending_for_device("pair-h", Endpoint::Two, "stale_phone")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Pending queue in DB is empty
+        assert!(
+            database
+                .pending("pair-h", Endpoint::Two)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Subsequent message arrives with sequence 4
+        database
+            .store("pair-h", Endpoint::One, "msg-4", &serde_json::json!("4"))
+            .await
+            .unwrap();
+
+        let pending_fresh = database
+            .pending_for_device("pair-h", Endpoint::Two, "fresh_phone")
+            .await
+            .unwrap();
+        assert_eq!(pending_fresh.len(), 1);
+        // Acknowledging sequence 4 on fresh_phone: stale_phone is at 3, so min_acked is 3 (already deleted)
+        let deleted = database
+            .acknowledge("pair-h", Endpoint::Two, "fresh_phone", 4)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+
+        // Once stale_phone also acks 4, sequence 4 is deleted
+        let deleted = database
+            .acknowledge("pair-h", Endpoint::Two, "stale_phone", 4)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+    }
 }
+

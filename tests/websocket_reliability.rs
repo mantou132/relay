@@ -255,3 +255,84 @@ async fn debug_logs_connections_messages_and_disconnects() {
     assert!(logs.contains("payload={\"hello\":\"logs\"}"), "{logs}");
     assert!(logs.contains("WebSocket endpoint disconnected"), "{logs}");
 }
+
+#[tokio::test]
+async fn ack_head_purges_stale_messages_on_connect() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _server = RelayServer::spawn(port, &database);
+
+    // Endpoint::One sends two messages while Endpoint::Two is offline
+    let mut ep1 = connect(port, "pair-ack", Endpoint::One, "dev-1").await;
+    expect_ready(&mut ep1, Endpoint::One).await;
+
+    send(
+        &mut ep1,
+        &ClientFrame::Message {
+            message_id: "m-1".to_string(),
+            payload: json!({ "count": 1 }),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut ep1).await,
+        ServerFrame::Stored {
+            message_id: "m-1".to_string()
+        }
+    );
+
+    send(
+        &mut ep1,
+        &ClientFrame::Message {
+            message_id: "m-2".to_string(),
+            payload: json!({ "count": 2 }),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut ep1).await,
+        ServerFrame::Stored {
+            message_id: "m-2".to_string()
+        }
+    );
+
+    // Endpoint::Two connects cold with ack_head=true
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-ack&endpoint=2&device_id=dev-2&ack_head=true");
+    let (mut ep2, _) = connect_async(&url).await.unwrap();
+    expect_ready(&mut ep2, Endpoint::Two).await;
+
+    // ep1 sends message 3 live
+    send(
+        &mut ep1,
+        &ClientFrame::Message {
+            message_id: "m-3".to_string(),
+            payload: json!({ "count": 3 }),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut ep1).await,
+        ServerFrame::Stored {
+            message_id: "m-3".to_string()
+        }
+    );
+
+    // ep2 immediately receives message 3; messages 1 and 2 were purged and never replayed!
+    assert_eq!(
+        receive(&mut ep2).await,
+        ServerFrame::Message {
+            message_id: "m-3".to_string(),
+            sequence: 3,
+            payload: json!({ "count": 3 }),
+        }
+    );
+}
+
