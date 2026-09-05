@@ -11,7 +11,7 @@ pub struct Model {
     pub message_id: String,
     pub destination: String,
     pub sequence: i64,
-    pub payload: Json,
+    pub payload_hash: String,
     #[sea_orm(indexed)]
     pub created_at: i64,
 }

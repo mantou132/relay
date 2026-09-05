@@ -14,6 +14,7 @@ use sea_orm::{
     sqlx::sqlite::{SqliteAutoVacuum, SqliteJournalMode, SqliteSynchronous},
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::Limits,
@@ -105,8 +106,10 @@ impl Database {
         }
         let destination = source.opposite().to_string();
         let source = source.to_string();
+        let serialized_payload = serde_json::to_vec(payload)?;
         let payload_bytes =
-            i64::try_from(serde_json::to_vec(payload)?.len()).context("payload is too large")?;
+            i64::try_from(serialized_payload.len()).context("payload is too large")?;
+        let payload_hash = format!("{:x}", Sha256::digest(&serialized_payload));
         let now = unix_timestamp()?;
         let transaction = self.connection.begin().await?;
 
@@ -120,7 +123,7 @@ impl Database {
 
         let sequence = if let Some(stored) = stored_receipt {
             anyhow::ensure!(
-                stored.destination == destination && stored.payload == *payload,
+                stored.destination == destination && stored.payload_hash == payload_hash,
                 "message_id was already used with a different payload"
             );
             stored.sequence
@@ -175,7 +178,7 @@ impl Database {
                 message_id: Set(message_id.to_owned()),
                 destination: Set(destination.clone()),
                 sequence: Set(sequence),
-                payload: Set(payload.clone()),
+                payload_hash: Set(payload_hash),
                 created_at: Set(now),
             }
             .insert(&transaction)
@@ -1164,4 +1167,3 @@ mod tests {
         );
     }
 }
-

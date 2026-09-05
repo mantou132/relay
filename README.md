@@ -23,10 +23,10 @@ variable:
 | `--database` | `RELAY_DATABASE` | `relay.sqlite3` |
 | `--max-pending-messages` | `RELAY_MAX_PENDING_MESSAGES` | `100000` per id and direction |
 | `--max-pending-bytes` | `RELAY_MAX_PENDING_BYTES` | `1073741824` per id and direction |
-| `--pending-retention-secs` | `RELAY_PENDING_RETENTION_SECS` | `604800` (7 days) |
-| `--receipt-retention-secs` | `RELAY_RECEIPT_RETENTION_SECS` | `2592000` (30 days) |
+| `--pending-retention-secs` | `RELAY_PENDING_RETENTION_SECS` | `3600` (1 hour) |
+| `--receipt-retention-secs` | `RELAY_RECEIPT_RETENTION_SECS` | `3600` (1 hour) |
 | `--device-retention-secs` | `RELAY_DEVICE_RETENTION_SECS` | `604800` (7 days) |
-| `--cleanup-interval-secs` | `RELAY_CLEANUP_INTERVAL_SECS` | `3600` (1 hour) |
+| `--cleanup-interval-secs` | `RELAY_CLEANUP_INTERVAL_SECS` | `600` (10 minutes) |
 
 Debug logging records connection and disconnection details, pairing ids,
 endpoints, message ids, JSON payloads, acknowledgements, and replay/forwarding
@@ -146,8 +146,8 @@ Delivery is at-least-once across endpoint disconnects and relay restarts:
    stable `message_id`.
 2. The sender retains the message and retries it until the relay returns
    `stored`.
-3. `stored` means both the pending delivery and its idempotency receipt were
-   committed to SQLite.
+3. `stored` means both the pending delivery and its idempotency receipt (storing
+   a compact SHA-256 payload hash to detect conflicting payloads) were committed to SQLite.
 4. The receiver processes messages in `sequence` order, durably records its
    cumulative receive cursor, and only then sends `ack`.
 5. The relay deletes acknowledged pending deliveries. Broadcast messages are purged
@@ -167,7 +167,7 @@ accepted even while the queue is full.
 Pending messages older than the configured retention period are removed along
 with their receipts. A later retry of the same `message_id` is therefore treated
 as a new delivery with a new sequence. Acknowledged receipts expire separately
-after the longer receipt-retention period.
+after the receipt-retention period (default: 1 hour).
 
 The relay detects dead connections itself: it pings every 30 seconds and closes
 a connection that has sent nothing (no frames, pongs, or pings) for 90 seconds.
