@@ -66,7 +66,7 @@ export type RelayClientOptions = {
   onPayload: (payload: unknown) => void | Promise<void>;
   onStateChange?: (state: RelayConnectionState, error?: string) => void;
   onDisconnect?: (error: Error) => void;
-  /** Called when a message is rejected by the server (e.g. queue full, payload too large, invalid format). */
+  /** Called before removing a rejected message from the outbox. */
   onMessageRejected?: (messageId: string, reason: string) => void;
   /** Storage key in localStorage if default store is used. Defaults to 'relay-client.v1'. */
   storageKey?: string;
@@ -108,11 +108,7 @@ export const localStorageStore = (relayId: string, storageKey = DEFAULT_STORAGE_
   };
 
   const save = (state: StoredState) => {
-    try {
-      localStorage.setItem(key, JSON.stringify(state));
-    } catch {
-      // Quota exceeded or private browsing restrictions
-    }
+    localStorage.setItem(key, JSON.stringify(state));
   };
 
   const load = (): StoredState => {
@@ -257,7 +253,12 @@ export class RelayClient {
   send = async (payload: unknown, targetDeviceId?: string) => {
     const message: OutboundMessage = { messageId: crypto.randomUUID(), payload, targetDeviceId };
     await this.#store.enqueue(message);
-    this.#flushOutbox();
+    try {
+      await this.#flushOutbox();
+    } catch (error) {
+      await this.#store.removeFromOutbox(message.messageId);
+      throw error;
+    }
   };
 
   #handleOpen = () => {
@@ -303,7 +304,7 @@ export class RelayClient {
         this.#relayReady = true;
         this.#reconnectDelay = MIN_RECONNECT_DELAY;
         this.#emitState('connected');
-        this.#flushOutbox();
+        await this.#flushOutbox();
         return;
       case 'stored': {
         this.#sent.delete(frame.message_id);
@@ -312,8 +313,11 @@ export class RelayClient {
       }
       case 'rejected': {
         this.#sent.delete(frame.message_id);
-        await this.#store.removeFromOutbox(frame.message_id);
-        this.#onMessageRejected?.(frame.message_id, frame.reason);
+        try {
+          this.#onMessageRejected?.(frame.message_id, frame.reason);
+        } finally {
+          await this.#store.removeFromOutbox(frame.message_id);
+        }
         return;
       }
       case 'message': {
