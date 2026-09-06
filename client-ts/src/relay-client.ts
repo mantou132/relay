@@ -89,7 +89,7 @@ export const isNewSequence = (lastReceived: number | undefined, sequence: number
   if (sequence <= lastReceived) return false;
   if (sequence !== lastReceived + 1) {
     console.warn(
-      `[RelayClient] 序列号跳跃：预期 ${lastReceived + 1}，收到 ${sequence}。自动同步接收游标。`,
+      `[RelayClient] Sequence gap: expected ${lastReceived + 1}, got ${sequence}. Auto-syncing receive cursor.`,
     );
     return true;
   }
@@ -197,9 +197,9 @@ export class RelayClient {
     storageKey,
     store,
   }: RelayClientOptions) {
-    if (!isRelayId(relayId)) throw new Error('Relay ID 必须为 1-256 字节的非空字符串');
+    if (!isRelayId(relayId)) throw new Error('Relay ID must be a non-empty string of 1-256 bytes');
     if (!store && typeof localStorage === 'undefined') {
-      throw new Error('当前环境不存在 localStorage，必须显式传入 store 实现');
+      throw new Error('localStorage is not available in current environment; an explicit store implementation must be provided');
     }
     this.relayId = relayId;
     this.#endpoint = endpoint;
@@ -251,7 +251,7 @@ export class RelayClient {
     clearTimeout(this.#reconnectTimer);
     this.#detachSocket()?.close();
     this.#emitState('disconnected');
-    this.#onDisconnect?.(new Error('Relay 连接已关闭'));
+    this.#onDisconnect?.(new Error('Relay connection closed'));
   };
 
   send = async (payload: unknown, targetDeviceId?: string) => {
@@ -279,13 +279,13 @@ export class RelayClient {
     this.#detachSocket();
     this.#relayReady = false;
     this.#sent.clear();
-    this.#onDisconnect?.(new Error('Relay 连接中断'));
+    this.#onDisconnect?.(new Error('Relay connection interrupted'));
     if (this.#manualClose) {
       this.#emitState('disconnected');
       return;
     }
     if (this.#preemptedSeen) {
-      this.#emitState('preempted', '连接已被同设备的新会话取代');
+      this.#emitState('preempted', 'Connection preempted by a new session on the same device');
       return;
     }
     this.#emitState('reconnecting');
@@ -298,7 +298,7 @@ export class RelayClient {
     switch (frame.type) {
       case 'ready':
         if (frame.endpoint !== this.#endpoint) {
-          throw new Error(`Relay 返回了错误的 endpoint: ${frame.endpoint}`);
+          throw new Error(`Relay returned invalid endpoint: ${frame.endpoint}`);
         }
         this.#relayReady = true;
         this.#reconnectDelay = MIN_RECONNECT_DELAY;
@@ -333,7 +333,7 @@ export class RelayClient {
           this.#socket?.close();
           return;
         }
-        throw new Error(`Relay 错误：${frame.message}`);
+        throw new Error(`Relay error: ${frame.message}`);
     }
   };
 
