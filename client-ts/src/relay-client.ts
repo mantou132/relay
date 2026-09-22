@@ -179,6 +179,16 @@ export class RelayClient {
   #reconnectDelay = MIN_RECONNECT_DELAY;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
   #receiveChain = Promise.resolve();
+  #storeChain = Promise.resolve();
+
+  #withStore = <T>(op: (store: RelayStore) => T | Promise<T>): Promise<T> => {
+    const task = this.#storeChain.then(() => op(this.#store));
+    this.#storeChain = task.then(
+      () => {},
+      () => {},
+    );
+    return task;
+  };
 
   constructor({
     relayId,
@@ -221,7 +231,7 @@ export class RelayClient {
 
     if (!this.#deviceId) {
       if (this.#store.deviceId) {
-        this.#deviceId = await this.#store.deviceId();
+        this.#deviceId = await this.#withStore((store) => store.deviceId?.());
       }
       if (!this.#deviceId) {
         this.#deviceId = crypto.randomUUID();
@@ -252,11 +262,11 @@ export class RelayClient {
 
   send = async (payload: unknown, targetDeviceId?: string) => {
     const message: OutboundMessage = { messageId: crypto.randomUUID(), payload, targetDeviceId };
-    await this.#store.enqueue(message);
+    await this.#withStore((store) => store.enqueue(message));
     try {
       await this.#flushOutbox();
     } catch (error) {
-      await this.#store.removeFromOutbox(message.messageId);
+      await this.#withStore((store) => store.removeFromOutbox(message.messageId));
       throw error;
     }
   };
@@ -308,7 +318,7 @@ export class RelayClient {
         return;
       case 'stored': {
         this.#sent.delete(frame.message_id);
-        await this.#store.removeFromOutbox(frame.message_id);
+        await this.#withStore((store) => store.removeFromOutbox(frame.message_id));
         return;
       }
       case 'rejected': {
@@ -316,18 +326,18 @@ export class RelayClient {
         try {
           this.#onMessageRejected?.(frame.message_id, frame.reason);
         } finally {
-          await this.#store.removeFromOutbox(frame.message_id);
+          await this.#withStore((store) => store.removeFromOutbox(frame.message_id));
         }
         return;
       }
       case 'message': {
-        const lastReceived = await this.#store.lastReceived();
+        const lastReceived = await this.#withStore((store) => store.lastReceived());
         if (!isNewSequence(lastReceived, frame.sequence)) {
           this.#sendFrame({ type: 'ack', sequence: frame.sequence });
           return;
         }
         await this.#onPayload(frame.payload);
-        await this.#store.markReceived(frame.sequence);
+        await this.#withStore((store) => store.markReceived(frame.sequence));
         this.#sendFrame({ type: 'ack', sequence: frame.sequence });
         return;
       }
@@ -343,7 +353,8 @@ export class RelayClient {
 
   #flushOutbox = async () => {
     if (!this.#relayReady || this.#socket?.readyState !== WebSocket.OPEN) return;
-    for (const message of await this.#store.outbox()) {
+    const messages = await this.#withStore((store) => store.outbox());
+    for (const message of messages) {
       if (this.#sent.has(message.messageId)) continue;
       this.#sendFrame({
         type: 'message',
