@@ -2,16 +2,51 @@
 //!
 //! Connects to the relay URL, sends protocol-level pings so the server's
 //! idle timeout sees this client as alive, and decodes [`ServerFrame`]s from
-//! text messages. The server's pings are answered automatically by
-//! tungstenite.
+//! text messages and [`Inbound::Binary`] from binary messages. The server's
+//! pings are answered automatically by tungstenite.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
-use crate::relay_frame::{ClientFrame, Endpoint, ServerFrame};
+use crate::relay_frame::{
+    BinaryHeader, ClientFrame, Endpoint, ServerFrame, decode_binary_frame, encode_binary_frame,
+};
+
+/// One message received from the relay.
+#[derive(Debug)]
+pub enum Inbound {
+    Frame(ServerFrame),
+    /// An ephemeral binary message from the peer.
+    Binary { message_id: String, body: Bytes },
+}
+
+/// Cloneable handle that writes to a connected transport from outside the
+/// connection loop. Sends wait while the socket's outgoing queue is full.
+#[derive(Clone)]
+pub struct TransportSender(tokio::sync::mpsc::Sender<Message>);
+
+impl TransportSender {
+    pub async fn send_frame(&self, frame: &ClientFrame) -> Result<()> {
+        let json = serde_json::to_string(frame).context("failed to encode relay frame")?;
+        self.send(Message::Text(json.into())).await
+    }
+
+    pub async fn send_binary(&self, header: &BinaryHeader, body: &[u8]) -> Result<()> {
+        self.send(Message::Binary(encode_binary_frame(header, body).into()))
+            .await
+    }
+
+    async fn send(&self, message: Message) -> Result<()> {
+        self.0
+            .send(message)
+            .await
+            .context("failed to send relay frame")
+    }
+}
 
 /// Interval for client pings. Keep well under the relay's idle timeout (90 s
 /// by default) so the relay never considers this connection half-open.
@@ -70,7 +105,7 @@ pub async fn connect(url: &str) -> Result<Transport> {
         }
     });
     Ok(Transport {
-        frame_tx,
+        sender: TransportSender(frame_tx),
         stream,
         ping_task,
     })
@@ -79,7 +114,7 @@ pub async fn connect(url: &str) -> Result<Transport> {
 /// A connected relay socket. Dropping it aborts the ping task and closes the
 /// connection.
 pub struct Transport {
-    frame_tx: tokio::sync::mpsc::Sender<Message>,
+    sender: TransportSender,
     stream: futures_util::stream::SplitStream<Socket>,
     ping_task: tokio::task::JoinHandle<()>,
 }
@@ -87,15 +122,15 @@ pub struct Transport {
 impl Transport {
     /// Sends one client frame as JSON text.
     pub async fn send_frame(&mut self, frame: &ClientFrame) -> Result<()> {
-        let json = serde_json::to_string(frame).context("failed to encode relay frame")?;
-        self.frame_tx
-            .send(Message::Text(json.into()))
-            .await
-            .context("failed to send relay frame")
+        self.sender.send_frame(frame).await
     }
 
-    /// Waits for the next server frame. Returns `Ok(None)` on a clean close.
-    pub async fn next_frame(&mut self) -> Result<Option<ServerFrame>> {
+    pub fn sender(&self) -> TransportSender {
+        self.sender.clone()
+    }
+
+    /// Waits for the next server message. Returns `Ok(None)` on a clean close.
+    pub async fn next_frame(&mut self) -> Result<Option<Inbound>> {
         loop {
             let Some(message) = self.stream.next().await else {
                 return Ok(None);
@@ -104,10 +139,18 @@ impl Transport {
                 Ok(Message::Text(text)) => {
                     let frame = serde_json::from_str::<ServerFrame>(&text)
                         .context("relay returned an invalid frame")?;
-                    return Ok(Some(frame));
+                    return Ok(Some(Inbound::Frame(frame)));
+                }
+                Ok(Message::Binary(bytes)) => {
+                    let (header, body_start) =
+                        decode_binary_frame(&bytes).map_err(anyhow::Error::msg)?;
+                    return Ok(Some(Inbound::Binary {
+                        message_id: header.message_id,
+                        body: bytes.slice(body_start..),
+                    }));
                 }
                 Ok(Message::Close(_)) => return Ok(None),
-                Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_)) => continue,
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
                 Ok(_) => continue,
                 Err(error) => {
                     // Conflicts arrive as a text frame followed by a clean

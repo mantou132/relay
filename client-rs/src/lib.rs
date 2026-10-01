@@ -5,6 +5,10 @@
 //! cursor with duplicate suppression, reconnection with exponential backoff,
 //! and session preemption handling.
 //!
+//! Ephemeral messages ([`Client::send_ephemeral`], [`Client::send_binary`])
+//! bypass all of that: they are written straight to the live socket, never
+//! stored or acknowledged, and fail while disconnected.
+//!
 //! Transports and storage are injected:
 //!
 //! - [`store::OutboxStore`] persists outbound messages and the receive
@@ -22,8 +26,10 @@ pub use relay_frame::{ClientFrame, Endpoint, ServerFrame};
 
 use std::{sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use serde_json::Value;
 use store::OutboxStore;
+use transport::{Inbound, TransportSender};
 
 /// Delay before the first reconnection attempt.
 pub const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -40,8 +46,13 @@ pub struct OutboundMessage {
 
 /// Callbacks invoked as the connection progresses.
 pub trait ClientHandler: Send + Sync + 'static {
-    /// Called for each accepted, in-order payload, before the ack is sent.
+    /// Called for each accepted, in-order payload, before the ack is sent,
+    /// and for each ephemeral text payload.
     fn on_payload(&self, payload: Value);
+    /// Called for each ephemeral binary message.
+    fn on_binary(&self, _message_id: &str, _body: Bytes) {}
+    /// Called when an ephemeral message reached no device of the peer endpoint.
+    fn on_undeliverable(&self, _message_id: &str, _reason: &str) {}
     /// Called when the relay accepts the connection.
     fn on_connected(&self) {}
     /// Called after every disconnect.
@@ -60,6 +71,8 @@ pub struct Client<S, H> {
     notify_send: Arc<tokio::sync::Notify>,
     shutdown: Arc<tokio::sync::Notify>,
     is_closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while a connection is ready, for ephemeral sends.
+    live: Arc<std::sync::Mutex<Option<TransportSender>>>,
 }
 
 impl<S, H> Clone for Client<S, H> {
@@ -72,6 +85,7 @@ impl<S, H> Clone for Client<S, H> {
             notify_send: self.notify_send.clone(),
             shutdown: self.shutdown.clone(),
             is_closed: self.is_closed.clone(),
+            live: self.live.clone(),
         }
     }
 }
@@ -103,6 +117,7 @@ where
             notify_send: Arc::new(tokio::sync::Notify::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live: Arc::default(),
         }
     }
 
@@ -128,6 +143,53 @@ where
         let message_id = self.store.enqueue_targeted(payload, target_device_id).await?;
         self.notify_send.notify_one();
         Ok(message_id)
+    }
+
+    /// Sends a payload over the live connection without storage or
+    /// acknowledgement. Fails while disconnected; delivery failures are
+    /// reported through [`ClientHandler::on_undeliverable`]. Pass `message_id`
+    /// to correlate that callback with an id of your own (non-empty, at most
+    /// 256 bytes); otherwise a random one is generated. Returns the message id.
+    pub async fn send_ephemeral(
+        &self,
+        payload: Value,
+        target_device_id: Option<String>,
+        message_id: Option<String>,
+    ) -> anyhow::Result<String> {
+        let message_id = message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.live_sender()?
+            .send_frame(&relay_frame::ClientFrame::Message {
+                message_id: message_id.clone(),
+                payload,
+                target_device_id,
+                ephemeral: true,
+            })
+            .await?;
+        Ok(message_id)
+    }
+
+    /// Sends bytes as an ephemeral binary frame; see [`Client::send_ephemeral`].
+    pub async fn send_binary(
+        &self,
+        body: &[u8],
+        target_device_id: Option<String>,
+        message_id: Option<String>,
+    ) -> anyhow::Result<String> {
+        let message_id = message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let header = relay_frame::BinaryHeader {
+            message_id: message_id.clone(),
+            target_device_id,
+        };
+        self.live_sender()?.send_binary(&header, body).await?;
+        Ok(message_id)
+    }
+
+    fn live_sender(&self) -> anyhow::Result<TransportSender> {
+        self.live
+            .lock()
+            .expect("live sender lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("relay is not connected"))
     }
 
     /// Notify the client that new messages have been enqueued into the store
@@ -161,7 +223,11 @@ where
                 _ = self.shutdown.notified() => {
                     return Ok(());
                 }
-                result = self.run_connection(&mut was_connected) => {
+                result = async {
+                    let result = self.run_connection(&mut was_connected).await;
+                    *self.live.lock().expect("live sender lock poisoned") = None;
+                    result
+                } => {
                     match result {
                         Ok(()) => self.handler.on_disconnected(None),
                         Err(error) => {
@@ -223,9 +289,18 @@ where
                     let Some(frame) = frame? else {
                         return Ok(());
                     };
+                    let frame = match frame {
+                        Inbound::Frame(frame) => frame,
+                        Inbound::Binary { message_id, body } => {
+                            self.handler.on_binary(&message_id, body);
+                            continue;
+                        }
+                    };
                     match frame {
                         relay_frame::ServerFrame::Ready { .. } => {
                             ready = true;
+                            *self.live.lock().expect("live sender lock poisoned") =
+                                Some(transport.sender());
                             self.handler.on_connected();
                             *was_connected = true;
                             // Resend everything un-stored once server confirms ready.
@@ -253,6 +328,12 @@ where
                                 .send_frame(&relay_frame::ClientFrame::Ack { sequence })
                                 .await?;
                         }
+                        relay_frame::ServerFrame::Ephemeral { payload, .. } => {
+                            self.handler.on_payload(payload);
+                        }
+                        relay_frame::ServerFrame::Undeliverable { message_id, reason } => {
+                            self.handler.on_undeliverable(&message_id, &reason);
+                        }
                         relay_frame::ServerFrame::Error { message } => {
                             if message.starts_with("connection_replaced:") {
                                 anyhow::bail!("connection_replaced: {message}");
@@ -277,6 +358,7 @@ where
                         message_id: message.message_id,
                         payload: message.payload,
                         target_device_id: message.target_device_id,
+                        ephemeral: false,
                     })
                     .await?;
             }
@@ -317,6 +399,8 @@ pub mod relay_frame {
             payload: Value,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             target_device_id: Option<String>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            ephemeral: bool,
         },
         /// Cumulative acknowledgement for all received sequences up to this one.
         Ack {
@@ -342,9 +426,50 @@ pub mod relay_frame {
             sequence: u64,
             payload: Value,
         },
+        Ephemeral {
+            message_id: String,
+            payload: Value,
+        },
+        Undeliverable {
+            message_id: String,
+            reason: String,
+        },
         Error {
             message: String,
         },
+    }
+
+    /// Binary frame layout: `[u16 big-endian header length][header JSON][body]`.
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    pub struct BinaryHeader {
+        pub message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_device_id: Option<String>,
+    }
+
+    pub fn encode_binary_frame(header: &BinaryHeader, body: &[u8]) -> Vec<u8> {
+        let header = serde_json::to_vec(header).expect("binary header serializes");
+        let header_len = u16::try_from(header.len()).expect("binary header fits in u16");
+        let mut frame = Vec::with_capacity(2 + header.len() + body.len());
+        frame.extend_from_slice(&header_len.to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// Returns the header and the byte offset at which the body starts.
+    pub fn decode_binary_frame(frame: &[u8]) -> Result<(BinaryHeader, usize), String> {
+        let len_bytes: [u8; 2] = frame
+            .get(..2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("binary frame is missing its header length")?;
+        let body_start = 2 + usize::from(u16::from_be_bytes(len_bytes));
+        let header = frame
+            .get(2..body_start)
+            .ok_or("binary frame header is truncated")?;
+        let header = serde_json::from_slice(header)
+            .map_err(|error| format!("invalid binary header: {error}"))?;
+        Ok((header, body_start))
     }
 }
 

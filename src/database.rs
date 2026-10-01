@@ -583,13 +583,13 @@ impl TryFrom<pending_message::Model> for StoredMessage {
     }
 }
 
-fn validate_message_id(message_id: &str) -> Result<()> {
+pub(crate) fn validate_message_id(message_id: &str) -> Result<()> {
     anyhow::ensure!(!message_id.is_empty(), "message_id must not be empty");
     anyhow::ensure!(message_id.len() <= MAX_ID_BYTES, "message_id is too long");
     Ok(())
 }
 
-fn validate_target_device_id(device_id: &str) -> Result<()> {
+pub(crate) fn validate_target_device_id(device_id: &str) -> Result<()> {
     anyhow::ensure!(!device_id.is_empty(), "target_device_id must not be empty");
     anyhow::ensure!(device_id.len() <= MAX_ID_BYTES, "target_device_id is too long");
     Ok(())

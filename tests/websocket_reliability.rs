@@ -134,6 +134,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             message_id: "endpoint_one-1".to_string(),
             payload: json!({ "request": 1 }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -152,6 +153,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             message_id: "pair-b-sentinel".to_string(),
             payload: json!({ "pair": "b" }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -194,6 +196,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             message_id: "endpoint_one-2".to_string(),
             payload: json!({ "request": 2 }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -239,6 +242,7 @@ async fn debug_logs_connections_messages_and_disconnects() {
             message_id: "logged-message".to_string(),
             payload: json!({ "hello": "logs" }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -281,6 +285,7 @@ async fn ack_head_purges_stale_messages_on_connect() {
             message_id: "m-1".to_string(),
             payload: json!({ "count": 1 }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -298,6 +303,7 @@ async fn ack_head_purges_stale_messages_on_connect() {
             message_id: "m-2".to_string(),
             payload: json!({ "count": 2 }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -321,6 +327,7 @@ async fn ack_head_purges_stale_messages_on_connect() {
             message_id: "m-3".to_string(),
             payload: json!({ "count": 3 }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await

@@ -6,6 +6,10 @@
  * with duplicate suppression, exponential-backoff reconnection, session preemption
  * handling, and multi-device support.
  *
+ * Ephemeral messages (`sendEphemeral`, `sendBinary`) bypass the outbox and
+ * cursor: they go straight to the live socket, are never stored or
+ * acknowledged, and throw while the relay is not connected.
+ *
  * Storage is injectable so non-browser hosts can persist the outbox; the
  * default uses localStorage. The browser WebSocket answers the relay's
  * pings automatically, which is what keeps the relay's idle timeout from
@@ -30,10 +34,12 @@ export type ServerFrame =
   | { type: 'stored'; message_id: string }
   | { type: 'rejected'; message_id: string; reason: string }
   | { type: 'message'; message_id: string; sequence: number; payload: unknown }
+  | { type: 'ephemeral'; message_id: string; payload: unknown }
+  | { type: 'undeliverable'; message_id: string; reason: string }
   | { type: 'error'; message: string };
 
 export type ClientFrame =
-  | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string }
+  | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string; ephemeral?: boolean }
   | { type: 'ack'; sequence: number };
 
 /** Persistence for outbound messages and the receive cursor. */
@@ -63,7 +69,12 @@ export type RelayClientOptions = {
    * Subsequent automatic reconnects will not send ack_head, preserving missed message replay.
    */
   ackHead?: boolean;
+  /** Receives durable payloads in sequence order, and ephemeral text payloads. */
   onPayload: (payload: unknown) => void | Promise<void>;
+  /** Receives ephemeral binary messages. */
+  onBinary?: (data: Uint8Array, messageId: string) => void | Promise<void>;
+  /** Called when an ephemeral message reached no device of the peer endpoint. */
+  onUndeliverable?: (messageId: string, reason: string) => void;
   onStateChange?: (state: RelayConnectionState, error?: string) => void;
   onDisconnect?: (error: Error) => void;
   /** Called before removing a rejected message from the outbox. */
@@ -94,6 +105,26 @@ export const isNewSequence = (lastReceived: number | undefined, sequence: number
     return true;
   }
   return true;
+};
+
+export type BinaryHeader = { message_id: string; target_device_id?: string };
+
+/** Binary frame layout: `[u16 big-endian header length][header JSON][body]`. */
+export const encodeBinaryFrame = (header: BinaryHeader, body: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+  const frame = new Uint8Array(2 + headerBytes.length + body.length);
+  new DataView(frame.buffer).setUint16(0, headerBytes.length);
+  frame.set(headerBytes, 2);
+  frame.set(body, 2 + headerBytes.length);
+  return frame;
+};
+
+export const decodeBinaryFrame = (frame: Uint8Array): { header: BinaryHeader; body: Uint8Array } => {
+  if (frame.length < 2) throw new Error('Binary frame is missing its header length');
+  const bodyStart = 2 + new DataView(frame.buffer, frame.byteOffset, 2).getUint16(0);
+  if (frame.length < bodyStart) throw new Error('Binary frame header is truncated');
+  const header = JSON.parse(new TextDecoder().decode(frame.subarray(2, bodyStart))) as BinaryHeader;
+  return { header, body: frame.subarray(bodyStart) };
 };
 
 export const DEFAULT_STORAGE_KEY = 'relay-client.v1';
@@ -168,6 +199,8 @@ export class RelayClient {
   #ackHead: boolean;
   #store: RelayStore;
   #onPayload: RelayClientOptions['onPayload'];
+  #onBinary?: RelayClientOptions['onBinary'];
+  #onUndeliverable?: RelayClientOptions['onUndeliverable'];
   #onStateChange?: RelayClientOptions['onStateChange'];
   #onDisconnect?: RelayClientOptions['onDisconnect'];
   #onMessageRejected?: RelayClientOptions['onMessageRejected'];
@@ -197,6 +230,8 @@ export class RelayClient {
     relayUrl,
     ackHead,
     onPayload,
+    onBinary,
+    onUndeliverable,
     onStateChange,
     onDisconnect,
     onMessageRejected,
@@ -214,6 +249,8 @@ export class RelayClient {
     this.#ackHead = ackHead ?? false;
     this.#store = store ?? localStorageStore(relayId, storageKey);
     this.#onPayload = onPayload;
+    this.#onBinary = onBinary;
+    this.#onUndeliverable = onUndeliverable;
     this.#onStateChange = onStateChange;
     this.#onDisconnect = onDisconnect;
     this.#onMessageRejected = onMessageRejected;
@@ -246,6 +283,7 @@ export class RelayClient {
       url.searchParams.set('ack_head', 'true');
     }
     const socket = new WebSocket(url);
+    socket.binaryType = 'arraybuffer';
     this.#socket = socket;
     socket.addEventListener('open', this.#handleOpen);
     socket.addEventListener('message', this.#handleMessage);
@@ -271,17 +309,55 @@ export class RelayClient {
     }
   };
 
+  /**
+   * Sends over the live connection without storage or acknowledgement; returns the message id.
+   * Pass `messageId` to correlate `onUndeliverable` with an id of your own (non-empty, at most 256 bytes).
+   */
+  sendEphemeral = (payload: unknown, targetDeviceId?: string, messageId: string = crypto.randomUUID()) => {
+    this.#liveSocket().send(
+      JSON.stringify({
+        type: 'message',
+        message_id: messageId,
+        payload,
+        ...(targetDeviceId ? { target_device_id: targetDeviceId } : {}),
+        ephemeral: true,
+      } satisfies ClientFrame),
+    );
+    return messageId;
+  };
+
+  /** Sends bytes as an ephemeral binary frame; see `sendEphemeral`. */
+  sendBinary = (data: Uint8Array, targetDeviceId?: string, messageId: string = crypto.randomUUID()) => {
+    const header: BinaryHeader = {
+      message_id: messageId,
+      ...(targetDeviceId ? { target_device_id: targetDeviceId } : {}),
+    };
+    this.#liveSocket().send(encodeBinaryFrame(header, data));
+    return messageId;
+  };
+
+  #liveSocket = () => {
+    if (!this.#relayReady || this.#socket?.readyState !== WebSocket.OPEN) {
+      throw new Error('Relay is not connected');
+    }
+    return this.#socket;
+  };
+
   #handleOpen = () => {
     this.#ackHead = false;
     this.#relayReady = false;
     this.#sent.clear();
   };
 
-  #handleMessage = (event: MessageEvent<string>) => {
+  #handleMessage = (event: MessageEvent<string | ArrayBuffer>) => {
     this.#receiveChain = this.#receiveChain
       .then(async () => {
-        const frame = JSON.parse(event.data) as ServerFrame;
-        await this.#handleFrame(frame);
+        if (typeof event.data === 'string') {
+          await this.#handleFrame(JSON.parse(event.data) as ServerFrame);
+          return;
+        }
+        const { header, body } = decodeBinaryFrame(new Uint8Array(event.data));
+        await this.#onBinary?.(body, header.message_id);
       })
       .catch((error) => this.#fail(error instanceof Error ? error : new Error(String(error))));
   };
@@ -341,6 +417,12 @@ export class RelayClient {
         this.#sendFrame({ type: 'ack', sequence: frame.sequence });
         return;
       }
+      case 'ephemeral':
+        await this.#onPayload(frame.payload);
+        return;
+      case 'undeliverable':
+        this.#onUndeliverable?.(frame.message_id, frame.reason);
+        return;
       case 'error':
         if (frame.message.startsWith('connection_replaced:')) {
           this.#preemptedSeen = true;

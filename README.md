@@ -120,6 +120,7 @@ Client to server:
 ```json
 {"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"}}
 {"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"},"target_device_id":"phone_a"}
+{"type":"message","message_id":"client-generated-id","payload":{"any":"json"},"ephemeral":true}
 {"type":"ack","sequence":42}
 ```
 
@@ -130,6 +131,8 @@ Server to client:
 {"type":"stored","message_id":"stable-client-generated-id"}
 {"type":"rejected","message_id":"stable-client-generated-id","reason":"description"}
 {"type":"message","message_id":"peer-message-id","sequence":42,"payload":{"any":"json"}}
+{"type":"ephemeral","message_id":"peer-message-id","payload":{"any":"json"}}
+{"type":"undeliverable","message_id":"client-generated-id","reason":"description"}
 {"type":"error","message":"description"}
 ```
 
@@ -137,6 +140,28 @@ Server to client:
 retries, and no longer than 256 bytes. `target_device_id` is an optional string
 specifying a target device on the opposite endpoint; if omitted, the message
 is broadcast to all active devices on that endpoint. WebSocket messages are limited to 10 MiB.
+
+Binary WebSocket messages, in both directions, are laid out as
+`[u16 big-endian header length][header JSON][body]`, where the header is
+`{"message_id":"...","target_device_id":"..."}` (`target_device_id` optional).
+They are always ephemeral, and the relay forwards them unchanged.
+
+## Ephemeral delivery
+
+Messages sent with `"ephemeral": true`, and all binary messages, skip the
+reliable-delivery contract below. They suit request/response traffic and media
+that is only useful while both sides are online:
+
+- The relay forwards them only to devices connected at that moment. Nothing is
+  written to SQLite, and no `stored`, sequence, `ack`, or replay is involved.
+- Ephemeral text arrives as `{"type":"ephemeral",...}`; binary arrives in the
+  same binary layout it was sent in.
+- If no device accepts the message, the sender receives `undeliverable`. That
+  happens when no matching device is connected, or when every match already
+  has 16 MiB of ephemeral data queued, so that a slow receiver cannot grow
+  relay memory. A broadcast that reaches only some devices is not reported.
+- Within one connection, ephemeral and durable messages keep their relative
+  order.
 
 ## Reliable delivery
 
@@ -187,6 +212,8 @@ returned to the filesystem.
 ## Client SDKs
 
 The repository includes official clients for Rust and TypeScript/JavaScript implementing the full delivery contract (persistent outbox, automatic retries until `stored`, cumulative acknowledgments, exponential backoff, and preemption handling).
+
+Both clients also send ephemeral messages (`send_ephemeral` / `send_binary` in Rust, `sendEphemeral` / `sendBinary` in TypeScript). These skip the outbox and fail immediately while the relay is not connected. Both take an optional message id (`message_id: Option<String>` in Rust, a third `messageId` argument in TypeScript), so an application can match `on_undeliverable` / `onUndeliverable` against its own ids. Ephemeral text is delivered through the regular payload callback, binary through `on_binary` / `onBinary`, and failed deliveries through `on_undeliverable` / `onUndeliverable`.
 
 ### Rust Client (`client-rs`)
 
@@ -243,6 +270,12 @@ async fn main() -> anyhow::Result<()> {
         .send_targeted(json!({ "hello": "phone" }), Some("phone_a".to_string()))
         .await?;
 
+    // Ephemeral JSON and bytes: live connection only, no outbox
+    client.send_ephemeral(json!({ "typing": true }), None, None).await?;
+    client.send_binary(&[0x89, 0x50, 0x4e, 0x47], Some("phone_a".to_string()), None).await?;
+    // Optional own message id, reported back by on_undeliverable
+    client.send_ephemeral(json!({ "request": 1 }), None, Some("request-1".to_string())).await?;
+
     // Close client when done (disconnects and exits run loop)
     // client.close();
 
@@ -266,6 +299,12 @@ const client = new RelayClient({
   onPayload: (payload) => {
     console.log('Received payload from peer:', payload);
   },
+  onBinary: (data, messageId) => {
+    console.log('Received bytes from peer:', messageId, data.byteLength);
+  },
+  onUndeliverable: (messageId, reason) => {
+    console.warn('Ephemeral message not delivered:', messageId, reason);
+  },
   onStateChange: (state, error) => {
     console.log('Connection state:', state, error);
   },
@@ -282,6 +321,12 @@ await client.send({ text: 'Hello from phone' });
 
 // Or send payload to a specific target device
 await client.send({ text: 'Hello specifically to desktop' }, 'desktop');
+
+// Ephemeral JSON and bytes: live connection only; throws while disconnected
+client.sendEphemeral({ typing: true });
+client.sendBinary(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), 'desktop');
+// Optional own message id, reported back by onUndeliverable
+client.sendEphemeral({ request: 1 }, undefined, 'request-1');
 
 // Close connection (stops reconnect loop)
 // client.close();

@@ -13,16 +13,15 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use relay::{ClientFrame, Endpoint, ServerFrame};
+use relay::{ClientFrame, Endpoint, ServerFrame, decode_binary_frame};
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     config::{Args, Limits},
-    database::{CleanupStats, Database},
-    hub::Hub,
+    database::{CleanupStats, Database, validate_message_id, validate_target_device_id},
+    hub::{ConnectionSender, Hub, connection_channel},
     keyed_lock::KeyedLock,
 };
 
@@ -122,7 +121,7 @@ async fn serve_socket(
 }
 
 async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: WebSocket) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = connection_channel();
     let (token, replayed) = {
         let _delivery = state.delivery.lock(&query.id).await;
 
@@ -201,14 +200,11 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
         ping.reset();
         loop {
             tokio::select! {
-                frame = rx.recv() => {
-                    let Some(frame) = frame else {
+                message = rx.recv() => {
+                    let Some(message) = message else {
                         break;
                     };
-                    let Ok(json) = serde_json::to_string(&frame) else {
-                        continue;
-                    };
-                    if sink.send(Message::Text(json.into())).await.is_err() {
+                    if sink.send(message).await.is_err() {
                         break;
                     }
                 }
@@ -253,13 +249,42 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
             Message::Text(text) => text,
             Message::Close(_) => break,
             Message::Ping(_) | Message::Pong(_) => continue,
-            Message::Binary(_) => continue,
+            Message::Binary(bytes) => {
+                match decode_binary_frame(&bytes) {
+                    Ok((header, body_start)) => {
+                        debug!(
+                            message_id = %header.message_id,
+                            target_device_id = ?header.target_device_id,
+                            body_bytes = bytes.len() - body_start,
+                            "binary message received"
+                        );
+                        // Forwarded unchanged: receivers parse the same header.
+                        let size = bytes.len();
+                        forward_ephemeral(
+                            &state,
+                            &query,
+                            &tx,
+                            header.message_id,
+                            header.target_device_id.as_deref(),
+                            Message::Binary(bytes),
+                            size,
+                        );
+                    }
+                    Err(error) => {
+                        debug!(%error, "client sent an invalid binary frame");
+                        tx.send(ServerFrame::Error {
+                            message: format!("invalid frame: {error}"),
+                        });
+                    }
+                }
+                continue;
+            }
         };
         let frame = match serde_json::from_str::<ClientFrame>(&text) {
             Ok(frame) => frame,
             Err(error) => {
                 debug!(%error, "client sent an invalid frame");
-                let _ = tx.send(ServerFrame::Error {
+                tx.send(ServerFrame::Error {
                     message: format!("invalid frame: {error}"),
                 });
                 continue;
@@ -271,6 +296,32 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 message_id,
                 payload,
                 target_device_id,
+                ephemeral: true,
+            } => {
+                debug!(%message_id, ?target_device_id, payload = %payload, "ephemeral message received");
+                let frame = ServerFrame::Ephemeral {
+                    message_id: message_id.clone(),
+                    payload,
+                };
+                let Ok(json) = serde_json::to_string(&frame) else {
+                    continue;
+                };
+                let size = json.len();
+                forward_ephemeral(
+                    &state,
+                    &query,
+                    &tx,
+                    message_id,
+                    target_device_id.as_deref(),
+                    Message::Text(json.into()),
+                    size,
+                );
+            }
+            ClientFrame::Message {
+                message_id,
+                payload,
+                target_device_id,
+                ephemeral: false,
             } => {
                 debug!(%message_id, ?target_device_id, payload = %payload, "message received");
                 let _delivery = state.delivery.lock(&query.id).await;
@@ -286,7 +337,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     .await
                 {
                     Ok(stored) => {
-                        let _ = tx.send(ServerFrame::Stored {
+                        tx.send(ServerFrame::Stored {
                             message_id: message_id.clone(),
                         });
                         if let Some(pending) = stored.pending {
@@ -300,7 +351,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     }
                     Err(error) => {
                         debug!(%message_id, %error, "message rejected");
-                        let _ = tx.send(ServerFrame::Rejected {
+                        tx.send(ServerFrame::Rejected {
                             message_id: message_id.clone(),
                             reason: error.to_string(),
                         });
@@ -316,7 +367,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     .await
                 {
                     debug!(sequence, %error, "acknowledgement failed");
-                    let _ = tx.send(ServerFrame::Error {
+                    tx.send(ServerFrame::Error {
                         message: error.to_string(),
                     });
                 }
@@ -330,6 +381,43 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
     writer.abort();
     let _ = writer.await;
     debug!(device_id = %query.device_id, "WebSocket endpoint disconnected");
+}
+
+/// Delivers an ephemeral message to the peer endpoint's live devices without
+/// storage. The sender only hears back when no device received it.
+fn forward_ephemeral(
+    state: &AppState,
+    query: &ConnectQuery,
+    tx: &ConnectionSender,
+    message_id: String,
+    target_device_id: Option<&str>,
+    message: Message,
+    size: usize,
+) {
+    let valid = validate_message_id(&message_id)
+        .and_then(|()| target_device_id.map_or(Ok(()), validate_target_device_id));
+    if let Err(error) = valid {
+        debug!(%message_id, %error, "ephemeral message rejected");
+        tx.send(ServerFrame::Rejected {
+            message_id,
+            reason: error.to_string(),
+        });
+        return;
+    }
+    let delivered = state.hub.send_ephemeral(
+        &query.id,
+        query.endpoint.opposite(),
+        target_device_id,
+        message,
+        size,
+    );
+    debug!(%message_id, delivered, "ephemeral message forwarded");
+    if delivered == 0 {
+        tx.send(ServerFrame::Undeliverable {
+            message_id,
+            reason: "no connected device accepted the message".to_string(),
+        });
+    }
 }
 
 /// Sends a terminal error frame and closes the socket, used when a connection

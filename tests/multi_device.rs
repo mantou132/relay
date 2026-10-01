@@ -110,6 +110,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             message_id: "m-1".to_string(),
             payload: json!({ "content": "broadcast_to_both" }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -158,6 +159,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             message_id: "m-2".to_string(),
             payload: json!({ "content": "offline_for_b" }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -206,6 +208,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             message_id: "m-3".to_string(),
             payload: json!({ "content": "seamless_continuation" }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -265,6 +268,7 @@ async fn same_device_reconnection_preempts_old_socket() {
             message_id: "preempt-1".to_string(),
             payload: json!({ "live": true }),
             target_device_id: None,
+            ephemeral: false,
         },
     )
     .await
@@ -342,6 +346,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             message_id: "m-target-a".to_string(),
             payload: json!({ "msg": "only_for_a" }),
             target_device_id: Some("phone_a".to_string()),
+            ephemeral: false,
         },
     )
     .await
@@ -375,6 +380,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             message_id: "m-target-b".to_string(),
             payload: json!({ "msg": "only_for_b" }),
             target_device_id: Some("phone_b".to_string()),
+            ephemeral: false,
         },
     )
     .await
@@ -408,6 +414,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             message_id: "m-target-a-offline".to_string(),
             payload: json!({ "msg": "offline_for_a" }),
             target_device_id: Some("phone_a".to_string()),
+            ephemeral: false,
         },
     )
     .await
