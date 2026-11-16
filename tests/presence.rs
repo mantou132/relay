@@ -194,6 +194,9 @@ struct PresenceRecorder {
 
 impl ClientHandler for PresenceRecorder {
     fn on_payload(&self, _payload: serde_json::Value) {}
+    fn on_connected(&self) {
+        self.events.lock().unwrap().push("connected".to_string());
+    }
     fn on_peer_connected(&self, device_id: &str) {
         self.events.lock().unwrap().push(format!("+{device_id}"));
     }
@@ -232,20 +235,24 @@ async fn rust_client_reports_peers_and_clears_them_on_close() {
         }
     };
 
-    wait_for(&["+host"]).await;
+    // The snapshot is reported before the connection itself.
+    wait_for(&["+host", "connected"]).await;
     let host2 = connect(port, "1", "host2", false).await;
-    wait_for(&["+host", "+host2"]).await;
+    wait_for(&["+host", "connected", "+host2"]).await;
     drop(host);
-    wait_for(&["+host", "+host2", "-host"]).await;
+    wait_for(&["+host", "connected", "+host2", "-host"]).await;
 
     // A replacement is reported again without a disconnect in between.
     let host2_again = connect(port, "1", "host2", false).await;
-    wait_for(&["+host", "+host2", "-host", "+host2"]).await;
+    wait_for(&["+host", "connected", "+host2", "-host", "+host2"]).await;
 
     // Closing reports the remaining peers offline.
     client.close();
     task.await.unwrap().unwrap();
-    assert_eq!(events(), ["+host", "+host2", "-host", "+host2", "-host2"]);
+    assert_eq!(
+        events(),
+        ["+host", "connected", "+host2", "-host", "+host2", "-host2"]
+    );
     drop(host2);
     drop(host2_again);
 }

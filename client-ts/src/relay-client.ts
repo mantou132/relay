@@ -82,10 +82,11 @@ export type RelayClientOptions = {
   /** Called before removing a rejected message from the outbox. */
   onMessageRejected?: (messageId: string, reason: string) => void;
   /**
-   * Called when a device of the opposite endpoint comes online, including once per device
-   * already online after each connect. Also called again, without a disconnect in between,
-   * when an online peer replaces its connection, since its session may have restarted.
-   * Passing either peer callback subscribes to presence.
+   * Called when a device of the opposite endpoint comes online. The devices already online are
+   * reported on each connect right before the `connected` state, so `peers` is complete by then.
+   * Also called again, without a disconnect in between, when an online peer replaces its
+   * connection, since its session may have restarted. Passing either peer callback subscribes
+   * to presence.
    */
   onPeerConnected?: (deviceId: string) => void;
   /**
@@ -220,7 +221,7 @@ export class RelayClient {
   #onMessageRejected?: RelayClientOptions['onMessageRejected'];
   #onPeerConnected?: RelayClientOptions['onPeerConnected'];
   #onPeerDisconnected?: RelayClientOptions['onPeerDisconnected'];
-  #peers = new Set<string>();
+  #peers: Set<string> | undefined;
   #socket?: WebSocket;
   #sent = new Set<string>();
   #relayReady = false;
@@ -277,8 +278,11 @@ export class RelayClient {
     this.#onPeerDisconnected = onPeerDisconnected;
   }
 
-  /** Devices of the opposite endpoint currently online, when subscribed to presence. */
-  get peers(): ReadonlySet<string> {
+  /**
+   * Devices of the opposite endpoint currently online. `undefined` unless the current connection
+   * reports presence: when not subscribed, while not connected, or when the relay predates presence.
+   */
+  get peers(): ReadonlySet<string> | undefined {
     return this.#peers;
   }
 
@@ -420,12 +424,15 @@ export class RelayClient {
         }
         this.#relayReady = true;
         this.#reconnectDelay = MIN_RECONNECT_DELAY;
-        this.#emitState('connected');
-        for (const deviceId of frame.peers ?? []) {
-          if (this.#peers.has(deviceId)) continue;
-          this.#peers.add(deviceId);
-          this.#onPeerConnected?.(deviceId);
+        // Before `connected`, so a state listener already knows which peers are online.
+        if (frame.peers) {
+          this.#peers = new Set();
+          for (const deviceId of frame.peers) {
+            this.#peers.add(deviceId);
+            this.#onPeerConnected?.(deviceId);
+          }
         }
+        this.#emitState('connected');
         await this.#flushOutbox();
         return;
       case 'stored': {
@@ -461,11 +468,11 @@ export class RelayClient {
         return;
       // Reported again on a replacement, since the peer's session may have restarted.
       case 'peer_connected':
-        this.#peers.add(frame.device_id);
+        (this.#peers ??= new Set()).add(frame.device_id);
         this.#onPeerConnected?.(frame.device_id);
         return;
       case 'peer_disconnected':
-        if (this.#peers.delete(frame.device_id)) this.#onPeerDisconnected?.(frame.device_id);
+        if (this.#peers?.delete(frame.device_id)) this.#onPeerDisconnected?.(frame.device_id);
         return;
       case 'error':
         if (frame.message.startsWith('connection_replaced:')) {
@@ -518,8 +525,8 @@ export class RelayClient {
    */
   #dropPeers = () => {
     this.#receiveChain = this.#receiveChain.then(() => {
-      const peers = [...this.#peers];
-      this.#peers.clear();
+      const peers = this.#peers ?? [];
+      this.#peers = undefined;
       for (const deviceId of peers) this.#onPeerDisconnected?.(deviceId);
     }).catch(() => {});
   };

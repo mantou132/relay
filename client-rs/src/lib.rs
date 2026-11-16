@@ -62,7 +62,8 @@ pub trait ClientHandler: Send + Sync + 'static {
     /// Called when a message was rejected by the server (e.g. invalid format, queue full, conflict).
     fn on_message_rejected(&self, _message_id: &str, _reason: &str) {}
     /// Called when a device of the opposite endpoint comes online, including
-    /// once per device already online after each connect. Also called again,
+    /// once per device already online on each connect, right before
+    /// [`ClientHandler::on_connected`]. Also called again,
     /// without a disconnect in between, when an online peer replaces its
     /// connection, since its session may have restarted. Requires
     /// [`Client::with_presence`].
@@ -327,13 +328,15 @@ where
                             ready = true;
                             *self.live.lock().expect("live sender lock poisoned") =
                                 Some(transport.sender());
-                            self.handler.on_connected();
-                            *was_connected = true;
+                            // Before `on_connected`, so the handler already knows
+                            // which peers are online when it is told about the connection.
                             for device_id in snapshot.into_iter().flatten() {
                                 if peers.insert(device_id.clone()) {
                                     self.handler.on_peer_connected(&device_id);
                                 }
                             }
+                            self.handler.on_connected();
+                            *was_connected = true;
                             // Resend everything un-stored once server confirms ready.
                             self.flush_outbox(&mut transport, &mut sent).await?;
                         }
