@@ -96,6 +96,8 @@ pub(crate) fn connection_channel() -> (ConnectionSender, ConnectionReceiver) {
 struct LiveConnection {
     token: u64,
     tx: ConnectionSender,
+    /// Whether the connection receives `peer_connected` / `peer_disconnected`.
+    presence: bool,
 }
 
 #[derive(Default)]
@@ -113,12 +115,17 @@ impl Hub {
     /// If an existing active connection exists for the same device, it is
     /// preempted (kicked) so mobile devices reconnecting or switching networks
     /// can take over their session immediately without waiting for timeouts.
+    ///
+    /// Presence frames are queued while the hub lock is held, so every
+    /// opted-in connection observes peers joining and leaving in one order
+    /// consistent with the snapshot it received in `ready`.
     pub(crate) fn register(
         &self,
         relay_id: &str,
         endpoint: Endpoint,
         device_id: &str,
         tx: ConnectionSender,
+        presence: bool,
         pending: Vec<StoredMessage>,
     ) -> u64 {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed) + 1;
@@ -126,20 +133,41 @@ impl Hub {
         let endpoint_connections = connections
             .entry((relay_id.to_string(), endpoint))
             .or_default();
-        if let Some(previous) = endpoint_connections.insert(
+        let previous = endpoint_connections.insert(
             device_id.to_string(),
             LiveConnection {
                 token,
                 tx: tx.clone(),
+                presence,
             },
-        ) {
+        );
+        let replaced = previous.is_some();
+        if let Some(previous) = previous {
             previous.tx.send(ServerFrame::Error {
                 message: "connection_replaced: another connection opened for this device"
                     .to_string(),
             });
         }
+        // Peers also hear about a replacement: the device stays online, but
+        // a new connection usually means a new session, e.g. a restarted host
+        // whose stale socket had not timed out yet.
+        let peers = connections.get(&(relay_id.to_string(), endpoint.opposite()));
+        notify_peers(
+            peers,
+            |device_id| ServerFrame::PeerConnected {
+                device_id,
+                replaced,
+            },
+            device_id,
+        );
 
-        tx.send(ServerFrame::Ready { endpoint });
+        let peers = presence.then(|| {
+            let mut peers: Vec<String> =
+                peers.into_iter().flat_map(HashMap::keys).cloned().collect();
+            peers.sort();
+            peers
+        });
+        tx.send(ServerFrame::Ready { endpoint, peers });
         for message in pending {
             tx.send(message.into_frame());
         }
@@ -244,10 +272,28 @@ impl Hub {
                 if devices.is_empty() {
                     entry.remove();
                 }
+                notify_peers(
+                    connections.get(&(relay_id.to_string(), endpoint.opposite())),
+                    |device_id| ServerFrame::PeerDisconnected { device_id },
+                    device_id,
+                );
                 return true;
             }
         }
         false
+    }
+}
+
+/// Queues a presence frame about `device_id` to every opted-in peer device.
+fn notify_peers(
+    peers: Option<&HashMap<String, LiveConnection>>,
+    frame: impl Fn(String) -> ServerFrame,
+    device_id: &str,
+) {
+    for peer in peers.into_iter().flat_map(HashMap::values) {
+        if peer.presence {
+            peer.tx.send(frame(device_id.to_string()));
+        }
     }
 }
 
@@ -270,11 +316,11 @@ mod tests {
         let (tx3, mut rx3) = connection_channel();
 
         // Register dev1 on (pair-1, Endpoint::One)
-        let _t1 = hub.register("pair-1", Endpoint::One, "dev1", tx1, Vec::new());
+        let _t1 = hub.register("pair-1", Endpoint::One, "dev1", tx1, false, Vec::new());
         // Register dev2 on (pair-1, Endpoint::Two)
-        let _t2 = hub.register("pair-1", Endpoint::Two, "dev2", tx2, Vec::new());
+        let _t2 = hub.register("pair-1", Endpoint::Two, "dev2", tx2, false, Vec::new());
         // Register dev3 on (pair-2, Endpoint::Two)
-        let _t3 = hub.register("pair-2", Endpoint::Two, "dev3", tx3, Vec::new());
+        let _t3 = hub.register("pair-2", Endpoint::Two, "dev3", tx3, false, Vec::new());
 
         // Drain Ready frames
         assert!(matches!(frame(&mut rx1).await, Some(ServerFrame::Ready { .. })));
@@ -296,7 +342,7 @@ mod tests {
 
         // Register dev4 also on (pair-1, Endpoint::Two)
         let (tx4, mut rx4) = connection_channel();
-        let _t4 = hub.register("pair-1", Endpoint::Two, "dev4", tx4, Vec::new());
+        let _t4 = hub.register("pair-1", Endpoint::Two, "dev4", tx4, false, Vec::new());
         assert!(matches!(frame(&mut rx4).await, Some(ServerFrame::Ready { .. })));
 
         // Send targeted to dev4 only
@@ -316,11 +362,11 @@ mod tests {
         let hub = Hub::default();
         let (tx1, mut rx1) = connection_channel();
         let (tx2, _rx2) = connection_channel();
-        let t1 = hub.register("pair-x", Endpoint::One, "phone", tx1, Vec::new());
+        let t1 = hub.register("pair-x", Endpoint::One, "phone", tx1, false, Vec::new());
         assert!(hub.is_current("pair-x", Endpoint::One, "phone", t1));
 
         // Preempt with new connection on same device
-        let t2 = hub.register("pair-x", Endpoint::One, "phone", tx2, Vec::new());
+        let t2 = hub.register("pair-x", Endpoint::One, "phone", tx2, false, Vec::new());
         assert!(!hub.is_current("pair-x", Endpoint::One, "phone", t1));
         assert!(hub.is_current("pair-x", Endpoint::One, "phone", t2));
 
@@ -344,7 +390,7 @@ mod tests {
     async fn ephemeral_skips_receivers_over_queue_budget() {
         let hub = Hub::default();
         let (tx, mut rx) = connection_channel();
-        hub.register("pair-e", Endpoint::Two, "phone", tx, Vec::new());
+        hub.register("pair-e", Endpoint::Two, "phone", tx, false, Vec::new());
         assert!(matches!(frame(&mut rx).await, Some(ServerFrame::Ready { .. })));
 
         let send = |target, size| {

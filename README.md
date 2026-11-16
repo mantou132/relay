@@ -166,12 +166,16 @@ Server to client:
 
 ```json
 {"type":"ready","endpoint":"1"}
+{"type":"ready","endpoint":"1","peers":["phone_a"]}
 {"type":"stored","message_id":"stable-client-generated-id"}
 {"type":"rejected","message_id":"stable-client-generated-id","reason":"description"}
 {"type":"message","message_id":"peer-message-id","sequence":42,"payload":{"any":"json"}}
 {"type":"ephemeral","message_id":"peer-message-id","payload":{"any":"json"}}
 {"type":"undeliverable","message_id":"client-generated-id","reason":"description"}
 {"type":"error","message":"description"}
+{"type":"peer_connected","device_id":"phone_a"}
+{"type":"peer_connected","device_id":"phone_a","replaced":true}
+{"type":"peer_disconnected","device_id":"phone_a"}
 ```
 
 `payload` may be any JSON value. `message_id` must be non-empty, stable across
@@ -200,6 +204,32 @@ that is only useful while both sides are online:
   relay memory. A broadcast that reaches only some devices is not reported.
 - Within one connection, ephemeral and durable messages keep their relative
   order.
+
+## Peer presence
+
+A connection that adds `presence=true` to its query string learns which
+devices of the opposite endpoint are online, without polling or a webhook:
+
+- Its `ready` frame carries `peers`, the sorted device ids of the opposite
+  endpoint connected at that moment. An empty list means no peer is online, so
+  a client can tell immediately. `peers` is omitted without the opt-in, and a
+  relay that predates presence ignores the parameter, so a missing `peers`
+  tells the client that no presence frames will follow.
+- Afterwards it receives `peer_connected` / `peer_disconnected` whenever a
+  device of the opposite endpoint connects or disconnects. Devices of its own
+  endpoint are not reported.
+- A connection that replaces an existing one for the same
+  `(id, endpoint, device_id)` is reported as `peer_connected` with
+  `"replaced": true`, without a `peer_disconnected` before it. The device stays
+  online, but a new connection usually means a new session, for example a host
+  that restarted before the relay noticed its old socket was dead, so peers
+  should treat it like a fresh connect.
+- A device that vanishes without closing its socket is reported once the
+  relay's idle timeout (`--idle-timeout-secs`, 90 seconds by default) drops it.
+- When its own connection ends, a client should consider every peer offline;
+  the next `ready` brings a fresh snapshot.
+
+Presence is opt-in because clients that predate it reject unknown frame types.
 
 ## Reliable delivery
 
@@ -249,9 +279,11 @@ returned to the filesystem.
 
 ## Client SDKs
 
-The repository includes official clients for Rust and TypeScript/JavaScript implementing the full delivery contract (persistent outbox, automatic retries until `stored`, cumulative acknowledgments, exponential backoff, and preemption handling).
+The repository includes official clients for Rust and TypeScript/JavaScript implementing the full delivery contract (persistent outbox, automatic retries until `stored`, cumulative acknowledgments, exponential backoff, and preemption handling). Both ignore server frame types and fields they do not know, so a newer relay can add frames without disconnecting them. The Rust client does so since this release; older Rust clients disconnect on an unknown frame type, which is why new frame types such as presence stay opt-in.
 
 Both clients also send ephemeral messages (`send_ephemeral` / `send_binary` in Rust, `sendEphemeral` / `sendBinary` in TypeScript). These skip the outbox and fail immediately while the relay is not connected. Both take an optional message id (`message_id: Option<String>` in Rust, a third `messageId` argument in TypeScript), so an application can match `on_undeliverable` / `onUndeliverable` against its own ids. Ephemeral text is delivered through the regular payload callback, binary through `on_binary` / `onBinary`, and failed deliveries through `on_undeliverable` / `onUndeliverable`.
+
+For [peer presence](#peer-presence), call `Client::with_presence()` and implement `on_peer_connected` / `on_peer_disconnected` in Rust, or pass `onPeerConnected` / `onPeerDisconnected` in TypeScript, which subscribes automatically and exposes the current set as `client.peers`. The `ready` snapshot is reported through the same callback. A peer that replaces its connection is reported connected again without a disconnect in between, since its session may have restarted. When the client's own connection ends, both report every known peer disconnected, so the callbacks always describe a consistent online set.
 
 ### Rust Client (`client-rs`)
 
@@ -282,6 +314,12 @@ impl ClientHandler for MyHandler {
     fn on_preempted(&self) {
         println!("Session preempted by a new connection from the same device");
     }
+    fn on_peer_connected(&self, device_id: &str) {
+        println!("Peer online: {device_id}");
+    }
+    fn on_peer_disconnected(&self, device_id: &str) {
+        println!("Peer offline: {device_id}");
+    }
 }
 
 #[tokio::main]
@@ -290,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(MemoryStore::new()); // Use a persistent OutboxStore in production
     let handler = Arc::new(MyHandler);
 
-    let client = Client::new(url, store, handler);
+    let client = Client::new(url, store, handler).with_presence();
 
     // Spawn client connection loop
     let client_task = client.clone();
@@ -348,6 +386,12 @@ const client = new RelayClient({
   },
   onDisconnect: (error) => {
     console.warn('Disconnected:', error.message);
+  },
+  onPeerConnected: (deviceId) => {
+    console.log('Peer online:', deviceId, [...client.peers]);
+  },
+  onPeerDisconnected: (deviceId) => {
+    console.log('Peer offline:', deviceId);
   },
 });
 

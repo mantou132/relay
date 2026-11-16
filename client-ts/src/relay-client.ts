@@ -30,13 +30,15 @@ export type OutboundMessage = {
 };
 
 export type ServerFrame =
-  | { type: 'ready'; endpoint: '1' | '2' }
+  | { type: 'ready'; endpoint: '1' | '2'; peers?: string[] }
   | { type: 'stored'; message_id: string }
   | { type: 'rejected'; message_id: string; reason: string }
   | { type: 'message'; message_id: string; sequence: number; payload: unknown }
   | { type: 'ephemeral'; message_id: string; payload: unknown }
   | { type: 'undeliverable'; message_id: string; reason: string }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'peer_connected'; device_id: string; replaced?: boolean }
+  | { type: 'peer_disconnected'; device_id: string };
 
 export type ClientFrame =
   | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string; ephemeral?: boolean }
@@ -79,6 +81,18 @@ export type RelayClientOptions = {
   onDisconnect?: (error: Error) => void;
   /** Called before removing a rejected message from the outbox. */
   onMessageRejected?: (messageId: string, reason: string) => void;
+  /**
+   * Called when a device of the opposite endpoint comes online, including once per device
+   * already online after each connect. Also called again, without a disconnect in between,
+   * when an online peer replaces its connection, since its session may have restarted.
+   * Passing either peer callback subscribes to presence.
+   */
+  onPeerConnected?: (deviceId: string) => void;
+  /**
+   * Called when a device of the opposite endpoint goes offline. When this client itself
+   * disconnects, it is called for every known peer, since their state is unknown until reconnect.
+   */
+  onPeerDisconnected?: (deviceId: string) => void;
   /** Storage key in localStorage if default store is used. Defaults to 'relay-client.v1'. */
   storageKey?: string;
   /** Defaults to a localStorage-backed store. */
@@ -204,6 +218,9 @@ export class RelayClient {
   #onStateChange?: RelayClientOptions['onStateChange'];
   #onDisconnect?: RelayClientOptions['onDisconnect'];
   #onMessageRejected?: RelayClientOptions['onMessageRejected'];
+  #onPeerConnected?: RelayClientOptions['onPeerConnected'];
+  #onPeerDisconnected?: RelayClientOptions['onPeerDisconnected'];
+  #peers = new Set<string>();
   #socket?: WebSocket;
   #sent = new Set<string>();
   #relayReady = false;
@@ -235,6 +252,8 @@ export class RelayClient {
     onStateChange,
     onDisconnect,
     onMessageRejected,
+    onPeerConnected,
+    onPeerDisconnected,
     storageKey,
     store,
   }: RelayClientOptions) {
@@ -254,6 +273,13 @@ export class RelayClient {
     this.#onStateChange = onStateChange;
     this.#onDisconnect = onDisconnect;
     this.#onMessageRejected = onMessageRejected;
+    this.#onPeerConnected = onPeerConnected;
+    this.#onPeerDisconnected = onPeerDisconnected;
+  }
+
+  /** Devices of the opposite endpoint currently online, when subscribed to presence. */
+  get peers(): ReadonlySet<string> {
+    return this.#peers;
   }
 
   connect = async (options?: { ackHead?: boolean }) => {
@@ -282,6 +308,9 @@ export class RelayClient {
     if (this.#ackHead) {
       url.searchParams.set('ack_head', 'true');
     }
+    if (this.#onPeerConnected || this.#onPeerDisconnected) {
+      url.searchParams.set('presence', 'true');
+    }
     const socket = new WebSocket(url);
     socket.binaryType = 'arraybuffer';
     this.#socket = socket;
@@ -294,6 +323,7 @@ export class RelayClient {
     this.#manualClose = true;
     clearTimeout(this.#reconnectTimer);
     this.#detachSocket()?.close();
+    this.#dropPeers();
     this.#emitState('disconnected');
     this.#onDisconnect?.(new Error('Relay connection closed'));
   };
@@ -366,6 +396,7 @@ export class RelayClient {
     this.#detachSocket();
     this.#relayReady = false;
     this.#sent.clear();
+    this.#dropPeers();
     this.#onDisconnect?.(new Error('Relay connection interrupted'));
     if (this.#manualClose) {
       this.#emitState('disconnected');
@@ -390,6 +421,11 @@ export class RelayClient {
         this.#relayReady = true;
         this.#reconnectDelay = MIN_RECONNECT_DELAY;
         this.#emitState('connected');
+        for (const deviceId of frame.peers ?? []) {
+          if (this.#peers.has(deviceId)) continue;
+          this.#peers.add(deviceId);
+          this.#onPeerConnected?.(deviceId);
+        }
         await this.#flushOutbox();
         return;
       case 'stored': {
@@ -422,6 +458,14 @@ export class RelayClient {
         return;
       case 'undeliverable':
         this.#onUndeliverable?.(frame.message_id, frame.reason);
+        return;
+      // Reported again on a replacement, since the peer's session may have restarted.
+      case 'peer_connected':
+        this.#peers.add(frame.device_id);
+        this.#onPeerConnected?.(frame.device_id);
+        return;
+      case 'peer_disconnected':
+        if (this.#peers.delete(frame.device_id)) this.#onPeerDisconnected?.(frame.device_id);
         return;
       case 'error':
         if (frame.message.startsWith('connection_replaced:')) {
@@ -466,6 +510,18 @@ export class RelayClient {
     socket.removeEventListener('close', this.#handleClose);
     this.#socket = undefined;
     return socket;
+  };
+
+  /**
+   * Reports every known peer offline once this connection ends. Queued behind frames
+   * still in the receive chain, so a late `peer_connected` cannot outlive the disconnect.
+   */
+  #dropPeers = () => {
+    this.#receiveChain = this.#receiveChain.then(() => {
+      const peers = [...this.#peers];
+      this.#peers.clear();
+      for (const deviceId of peers) this.#onPeerDisconnected?.(deviceId);
+    }).catch(() => {});
   };
 
   #emitState = (state: RelayConnectionState, error?: string) => this.#onStateChange?.(state, error);

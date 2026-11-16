@@ -69,11 +69,13 @@ pub fn endpoint_url(
 
 /// Appends `ack_head=true` query parameter to a connect URL.
 pub fn append_ack_head(url: &str) -> String {
-    if url.contains('?') {
-        format!("{url}&ack_head=true")
-    } else {
-        format!("{url}?ack_head=true")
-    }
+    append_query(url, "ack_head=true")
+}
+
+/// Appends one `key=value` query parameter to a connect URL.
+pub fn append_query(url: &str, parameter: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{parameter}")
 }
 
 pub async fn connect(url: &str) -> Result<Transport> {

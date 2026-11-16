@@ -61,6 +61,17 @@ pub trait ClientHandler: Send + Sync + 'static {
     fn on_preempted(&self) {}
     /// Called when a message was rejected by the server (e.g. invalid format, queue full, conflict).
     fn on_message_rejected(&self, _message_id: &str, _reason: &str) {}
+    /// Called when a device of the opposite endpoint comes online, including
+    /// once per device already online after each connect. Also called again,
+    /// without a disconnect in between, when an online peer replaces its
+    /// connection, since its session may have restarted. Requires
+    /// [`Client::with_presence`].
+    fn on_peer_connected(&self, _device_id: &str) {}
+    /// Called when a device of the opposite endpoint goes offline. When this
+    /// client itself disconnects, it is called for every peer first, since
+    /// their state is unknown until the next connect. Requires
+    /// [`Client::with_presence`].
+    fn on_peer_disconnected(&self, _device_id: &str) {}
 }
 
 pub struct Client<S, H> {
@@ -119,6 +130,14 @@ where
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live: Arc::default(),
         }
+    }
+
+    /// Subscribes to presence of the opposite endpoint's devices, reported
+    /// through [`ClientHandler::on_peer_connected`] and
+    /// [`ClientHandler::on_peer_disconnected`].
+    pub fn with_presence(mut self) -> Self {
+        self.url = Arc::new(transport::append_query(&self.url, "presence=true"));
+        self
     }
 
     /// Signals the client to stop running and disconnect cleanly.
@@ -219,27 +238,30 @@ where
             }
 
             let mut was_connected = false;
-            tokio::select! {
-                _ = self.shutdown.notified() => {
-                    return Ok(());
-                }
+            let mut peers = std::collections::HashSet::new();
+            let closed = tokio::select! {
+                _ = self.shutdown.notified() => None,
                 result = async {
-                    let result = self.run_connection(&mut was_connected).await;
+                    let result = self.run_connection(&mut was_connected, &mut peers).await;
                     *self.live.lock().expect("live sender lock poisoned") = None;
                     result
-                } => {
-                    match result {
-                        Ok(()) => self.handler.on_disconnected(None),
-                        Err(error) => {
-                            let err_str = error.to_string();
-                            if err_str.contains("connection_replaced") {
-                                self.handler.on_preempted();
-                                self.handler.on_disconnected(Some(err_str));
-                                return Ok(());
-                            }
-                            self.handler.on_disconnected(Some(err_str));
-                        }
+                } => Some(result),
+            };
+            // Peer state is unknown once this connection ends.
+            for device_id in peers {
+                self.handler.on_peer_disconnected(&device_id);
+            }
+            match closed {
+                None => return Ok(()),
+                Some(Ok(())) => self.handler.on_disconnected(None),
+                Some(Err(error)) => {
+                    let err_str = error.to_string();
+                    if err_str.contains("connection_replaced") {
+                        self.handler.on_preempted();
+                        self.handler.on_disconnected(Some(err_str));
+                        return Ok(());
                     }
+                    self.handler.on_disconnected(Some(err_str));
                 }
             }
 
@@ -262,7 +284,11 @@ where
         }
     }
 
-    async fn run_connection(&self, was_connected: &mut bool) -> anyhow::Result<()> {
+    async fn run_connection(
+        &self,
+        was_connected: &mut bool,
+        peers: &mut std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
         let should_ack_head = self.ack_head.load(std::sync::atomic::Ordering::Relaxed);
         let connect_url = if should_ack_head {
             transport::append_ack_head(&self.url)
@@ -297,12 +323,17 @@ where
                         }
                     };
                     match frame {
-                        relay_frame::ServerFrame::Ready { .. } => {
+                        relay_frame::ServerFrame::Ready { peers: snapshot, .. } => {
                             ready = true;
                             *self.live.lock().expect("live sender lock poisoned") =
                                 Some(transport.sender());
                             self.handler.on_connected();
                             *was_connected = true;
+                            for device_id in snapshot.into_iter().flatten() {
+                                if peers.insert(device_id.clone()) {
+                                    self.handler.on_peer_connected(&device_id);
+                                }
+                            }
                             // Resend everything un-stored once server confirms ready.
                             self.flush_outbox(&mut transport, &mut sent).await?;
                         }
@@ -334,6 +365,18 @@ where
                         relay_frame::ServerFrame::Undeliverable { message_id, reason } => {
                             self.handler.on_undeliverable(&message_id, &reason);
                         }
+                        // Reported again on a replacement, since the peer's
+                        // session may have restarted.
+                        relay_frame::ServerFrame::PeerConnected { device_id, .. } => {
+                            peers.insert(device_id.clone());
+                            self.handler.on_peer_connected(&device_id);
+                        }
+                        relay_frame::ServerFrame::PeerDisconnected { device_id } => {
+                            if peers.remove(&device_id) {
+                                self.handler.on_peer_disconnected(&device_id);
+                            }
+                        }
+                        relay_frame::ServerFrame::Unknown => {}
                         relay_frame::ServerFrame::Error { message } => {
                             if message.starts_with("connection_replaced:") {
                                 anyhow::bail!("connection_replaced: {message}");
@@ -413,6 +456,8 @@ pub mod relay_frame {
     pub enum ServerFrame {
         Ready {
             endpoint: Endpoint,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            peers: Option<Vec<String>>,
         },
         Stored {
             message_id: String,
@@ -437,6 +482,18 @@ pub mod relay_frame {
         Error {
             message: String,
         },
+        PeerConnected {
+            device_id: String,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            replaced: bool,
+        },
+        PeerDisconnected {
+            device_id: String,
+        },
+        /// A frame type this client does not know, sent by a newer relay.
+        /// Ignored, so new frame types do not disconnect older clients.
+        #[serde(other)]
+        Unknown,
     }
 
     /// Binary frame layout: `[u16 big-endian header length][header JSON][body]`.

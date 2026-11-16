@@ -106,7 +106,7 @@ async fn receive(socket: &mut Socket) -> ServerFrame {
 }
 
 async fn expect_ready(socket: &mut Socket, endpoint: Endpoint) {
-    assert_eq!(receive(socket).await, ServerFrame::Ready { endpoint });
+    assert_eq!(receive(socket).await, ServerFrame::Ready { endpoint, peers: None });
 }
 
 #[tokio::test]

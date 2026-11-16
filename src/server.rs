@@ -46,6 +46,10 @@ struct ConnectQuery {
     device_id: String,
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     ack_head: bool,
+    /// Opts in to `peer_connected` / `peer_disconnected` frames. Off by
+    /// default because older clients reject frame types they do not know.
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    presence: bool,
 }
 
 fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
@@ -179,6 +183,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
             query.endpoint,
             &query.device_id,
             tx.clone(),
+            query.presence,
             pending,
         );
         (token, replayed)

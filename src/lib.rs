@@ -57,6 +57,11 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     Ready {
         endpoint: Endpoint,
+        /// Devices of the opposite endpoint connected at this moment. Present
+        /// only on connections that opted in with `presence=true`, so its
+        /// presence also tells the client that the relay supports presence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peers: Option<Vec<String>>,
     },
     /// The server durably stored an outbound message. The sender may now remove
     /// it from its local outbox; resending the id remains idempotent.
@@ -87,6 +92,21 @@ pub enum ServerFrame {
     },
     Error {
         message: String,
+    },
+    /// A device of the opposite endpoint connected. Sent only to connections
+    /// that opted in with `presence=true`.
+    PeerConnected {
+        device_id: String,
+        /// The device was already online and opened a connection that
+        /// replaced its previous one, for example after a network change or a
+        /// restart. Its session state may have been lost.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replaced: bool,
+    },
+    /// A device of the opposite endpoint disconnected. Sent only to
+    /// connections that opted in with `presence=true`.
+    PeerDisconnected {
+        device_id: String,
     },
 }
 
