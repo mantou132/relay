@@ -4,6 +4,7 @@ mod entity;
 mod hub;
 mod keyed_lock;
 mod server;
+mod webhook;
 
 use anyhow::Result;
 use clap::Parser;

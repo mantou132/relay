@@ -214,7 +214,24 @@ impl Hub {
             .is_some_and(|connection| connection.token == token)
     }
 
-    pub(crate) fn remove(&self, relay_id: &str, endpoint: Endpoint, device_id: &str, token: u64) {
+    /// Number of devices of the endpoint that are connected.
+    pub(crate) fn online_devices(&self, relay_id: &str, endpoint: Endpoint) -> usize {
+        self.connections
+            .lock()
+            .expect("hub lock poisoned")
+            .get(&(relay_id.to_string(), endpoint))
+            .map_or(0, HashMap::len)
+    }
+
+    /// Removes the connection if it is still the current one for its device,
+    /// returning whether it was. A preempted connection returns `false`.
+    pub(crate) fn remove(
+        &self,
+        relay_id: &str,
+        endpoint: Endpoint,
+        device_id: &str,
+        token: u64,
+    ) -> bool {
         let mut connections = self.connections.lock().expect("hub lock poisoned");
         let key = (relay_id.to_string(), endpoint);
         if let Entry::Occupied(mut entry) = connections.entry(key) {
@@ -227,8 +244,10 @@ impl Hub {
                 if devices.is_empty() {
                     entry.remove();
                 }
+                return true;
             }
         }
+        false
     }
 }
 

@@ -88,6 +88,14 @@ pub(crate) struct Args {
         default_value_t = DEFAULT_IDLE_TIMEOUT_SECS
     )]
     pub(crate) idle_timeout_secs: u64,
+
+    /// URL that receives a JSON POST whenever a device connects or disconnects.
+    #[arg(long, env = "RELAY_WEBHOOK_URL")]
+    pub(crate) webhook_url: Option<String>,
+
+    /// Shared secret used to sign webhook requests with HMAC-SHA256.
+    #[arg(long, env = "RELAY_WEBHOOK_SECRET", hide_env_values = true)]
+    pub(crate) webhook_secret: Option<String>,
 }
 
 impl Args {

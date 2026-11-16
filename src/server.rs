@@ -23,6 +23,7 @@ use crate::{
     database::{CleanupStats, Database, validate_message_id, validate_target_device_id},
     hub::{ConnectionSender, Hub, connection_channel},
     keyed_lock::KeyedLock,
+    webhook::{Event, EventKind, Webhook},
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -35,6 +36,7 @@ struct AppState {
     limits: Limits,
     /// Fine-grained keyed locks per relay_id to eliminate cross-pairing contention.
     delivery: Arc<KeyedLock>,
+    webhook: Option<Arc<Webhook>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +184,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
         (token, replayed)
     };
 
+    notify_presence(&state, &query, EventKind::DeviceConnected);
     debug!(
         replayed_messages = replayed,
         device_id = %query.device_id,
@@ -375,12 +378,32 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
         }
     }
 
-    state
+    // A preempted connection is not reported: its device is still online
+    // through the connection that replaced it.
+    if state
         .hub
-        .remove(&query.id, query.endpoint, &query.device_id, token);
+        .remove(&query.id, query.endpoint, &query.device_id, token)
+    {
+        notify_presence(&state, &query, EventKind::DeviceDisconnected);
+    }
     writer.abort();
     let _ = writer.await;
     debug!(device_id = %query.device_id, "WebSocket endpoint disconnected");
+}
+
+fn notify_presence(state: &AppState, query: &ConnectQuery, kind: EventKind) {
+    if let Some(webhook) = &state.webhook {
+        let online_devices = state.hub.online_devices(&query.id, query.endpoint);
+        let peer_online = state.hub.online_devices(&query.id, query.endpoint.opposite()) > 0;
+        webhook.notify(Event::new(
+            kind,
+            &query.id,
+            query.endpoint,
+            &query.device_id,
+            online_devices,
+            peer_online,
+        ));
+    }
 }
 
 /// Delivers an ephemeral message to the peer endpoint's live devices without
@@ -451,6 +474,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         hub: Arc::default(),
         limits,
         delivery: Arc::default(),
+        webhook: Webhook::new(args.webhook_url, args.webhook_secret)?.map(|webhook| {
+            info!("webhook notifications enabled");
+            Arc::new(webhook)
+        }),
     };
     let router = Router::new()
         .route("/ws", get(websocket_handler))

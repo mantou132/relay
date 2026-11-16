@@ -14,6 +14,8 @@ axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sea-orm = { version = "2.0.2", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

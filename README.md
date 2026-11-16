@@ -27,6 +27,8 @@ variable:
 | `--receipt-retention-secs` | `RELAY_RECEIPT_RETENTION_SECS` | `3600` (1 hour) |
 | `--device-retention-secs` | `RELAY_DEVICE_RETENTION_SECS` | `604800` (7 days) |
 | `--cleanup-interval-secs` | `RELAY_CLEANUP_INTERVAL_SECS` | `600` (10 minutes) |
+| `--webhook-url` | `RELAY_WEBHOOK_URL` | disabled |
+| `--webhook-secret` | `RELAY_WEBHOOK_SECRET` | unsigned |
 
 Debug logging records connection and disconnection details, pairing ids,
 endpoints, message ids, JSON payloads, acknowledgements, and replay/forwarding
@@ -91,6 +93,42 @@ the same id:
 The pairing id is the channel's access credential. Generate it with sufficient
 entropy, keep it secret, and avoid recording WebSocket query strings in proxy
 access logs.
+
+## Presence webhook
+
+With `--webhook-url` set, the relay POSTs a JSON event whenever a device
+connects or disconnects. A typical use is waking the host of one endpoint, for
+example starting a virtual machine, when a phone on the other endpoint comes
+online:
+
+```json
+{"event":"device_connected","id":"<pair-id>","endpoint":"2","device_id":"phone","online_devices":1,"peer_online":false,"timestamp":1700000000000}
+```
+
+- `event` is `device_connected` or `device_disconnected`, also sent in the
+  `X-Relay-Event` header.
+- `online_devices` counts the devices of `endpoint` connected right after the
+  event. With several phones on one endpoint, a `device_disconnected` with
+  `online_devices: 0` means the last one left, for example to stop the host.
+  Counts are snapshots and events can arrive out of order after retries, so
+  order them by `timestamp`.
+- `peer_online` tells whether any device of the opposite endpoint is connected
+  at that moment, so a receiver can skip starting a host that is already up.
+- A connection that takes over an existing `(id, endpoint, device_id)` reports
+  `device_connected` again but no `device_disconnected` for the replaced socket.
+  Mobile clients reconnect often, so receivers should treat repeated events as
+  idempotent.
+- Delivery is asynchronous and never delays the WebSocket. Failed requests
+  (network errors, 5xx, 429) are retried up to 4 times with exponential backoff
+  starting at 1 second; other 4xx responses are not retried. At most 256
+  deliveries are in flight; further events are dropped and logged.
+- With `--webhook-secret`, each request carries `X-Relay-Timestamp` (Unix
+  seconds) and `X-Relay-Signature: sha256=<hex>`, the HMAC-SHA256 of
+  `"{timestamp}.{raw body}"`. Verify it with a constant-time comparison and
+  reject stale timestamps.
+
+The event contains the pairing id, which is a channel credential. Only point
+the webhook at a service you trust, over HTTPS.
 
 ## Health Check
 
