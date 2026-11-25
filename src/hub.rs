@@ -1,14 +1,14 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use axum::extract::ws::Message;
 use relay::{Endpoint, ServerFrame};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::database::StoredMessage;
 
@@ -21,74 +21,212 @@ const MAX_QUEUED_EPHEMERAL_BYTES: usize = 16 * 1024 * 1024;
 enum Outgoing {
     Frame(ServerFrame),
     /// Pre-encoded so a broadcast shares one buffer across devices.
-    Ephemeral { message: Message, size: usize },
+    Ephemeral {
+        message: Message,
+        size: usize,
+        replace_key: Option<String>,
+    },
+}
+
+#[derive(Default)]
+struct QueueState {
+    entries: VecDeque<Outgoing>,
+    queued_ephemeral: usize,
+    sender_closed: bool,
+    receiver_closed: bool,
+}
+
+impl QueueState {
+    fn push_frame(&mut self, frame: ServerFrame) -> bool {
+        if self.receiver_closed {
+            return false;
+        }
+        self.entries.push_back(Outgoing::Frame(frame));
+        true
+    }
+
+    fn push_ephemeral(
+        &mut self,
+        message: Message,
+        size: usize,
+        replace_key: Option<&str>,
+    ) -> bool {
+        if self.receiver_closed {
+            return false;
+        }
+        if let Some(key) = replace_key {
+            for entry in &mut self.entries {
+                if let Outgoing::Ephemeral {
+                    message: slot_message,
+                    size: slot_size,
+                    replace_key: Some(slot_key),
+                } = entry
+                    && slot_key == key
+                {
+                    let remaining = self.queued_ephemeral - *slot_size;
+                    if remaining != 0 && remaining + size > MAX_QUEUED_EPHEMERAL_BYTES {
+                        return false;
+                    }
+                    self.queued_ephemeral = remaining + size;
+                    *slot_message = message;
+                    *slot_size = size;
+                    return true;
+                }
+            }
+        }
+
+        if self.queued_ephemeral != 0 && self.queued_ephemeral + size > MAX_QUEUED_EPHEMERAL_BYTES {
+            return false;
+        }
+        self.entries.push_back(Outgoing::Ephemeral {
+            message,
+            size,
+            replace_key: replace_key.map(str::to_owned),
+        });
+        self.queued_ephemeral += size;
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<Outgoing> {
+        let item = self.entries.pop_front()?;
+        if let Outgoing::Ephemeral { size, .. } = item {
+            // Released once handed to the socket writer, which is
+            // where a slow receiver's backlog actually accumulates.
+            self.queued_ephemeral -= size;
+        }
+        Some(item)
+    }
+}
+
+#[derive(Default)]
+struct ConnectionQueue {
+    state: Mutex<QueueState>,
+    notify: Notify,
+}
+
+struct SenderGuard(Arc<ConnectionQueue>);
+
+impl Drop for SenderGuard {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .expect("queue lock poisoned")
+            .sender_closed = true;
+        self.0.notify.notify_one();
+    }
 }
 
 /// Sending half of one connection's outgoing queue.
 #[derive(Clone)]
 pub(crate) struct ConnectionSender {
-    tx: mpsc::UnboundedSender<Outgoing>,
-    queued_ephemeral: Arc<AtomicUsize>,
+    inner: Arc<SenderGuard>,
 }
 
 impl ConnectionSender {
     pub(crate) fn send(&self, frame: ServerFrame) {
-        let _ = self.tx.send(Outgoing::Frame(frame));
+        let queued = self
+            .inner
+            .0
+            .state
+            .lock()
+            .expect("queue lock poisoned")
+            .push_frame(frame);
+        if queued {
+            self.inner.0.notify.notify_one();
+        }
     }
 
-    fn send_ephemeral(&self, message: Message, size: usize) -> bool {
-        let reserved = self
-            .queued_ephemeral
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                (queued == 0 || queued + size <= MAX_QUEUED_EPHEMERAL_BYTES)
-                    .then_some(queued + size)
-            })
-            .is_ok();
-        if reserved && self.tx.send(Outgoing::Ephemeral { message, size }).is_err() {
-            self.queued_ephemeral.fetch_sub(size, Ordering::AcqRel);
-            return false;
+    fn send_ephemeral(&self, message: Message, size: usize, replace_key: Option<&str>) -> bool {
+        let accepted = self
+            .inner
+            .0
+            .state
+            .lock()
+            .expect("queue lock poisoned")
+            .push_ephemeral(message, size, replace_key);
+        if accepted {
+            self.inner.0.notify.notify_one();
         }
-        reserved
+        accepted
     }
 }
 
 /// Receiving half, owned by the connection's writer task.
 pub(crate) struct ConnectionReceiver {
-    rx: mpsc::UnboundedReceiver<Outgoing>,
-    queued_ephemeral: Arc<AtomicUsize>,
+    queue: Arc<ConnectionQueue>,
 }
 
 impl ConnectionReceiver {
     pub(crate) async fn recv(&mut self) -> Option<Message> {
         loop {
-            match self.rx.recv().await? {
-                Outgoing::Frame(frame) => match serde_json::to_string(&frame) {
-                    Ok(json) => return Some(Message::Text(json.into())),
-                    Err(_) => continue,
-                },
-                Outgoing::Ephemeral { message, size } => {
-                    // Released once handed to the socket writer, which is
-                    // where a slow receiver's backlog actually accumulates.
-                    self.queued_ephemeral.fetch_sub(size, Ordering::AcqRel);
+            let notified = self.queue.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let next = {
+                let mut state = self.queue.state.lock().expect("queue lock poisoned");
+                if let Some(item) = state.pop_front() {
+                    Some(item)
+                } else if state.sender_closed {
+                    return None;
+                } else {
+                    None
+                }
+            };
+
+            if let Some(item) = next {
+                if let Some(message) = outgoing_to_message(item) {
                     return Some(message);
                 }
+                continue;
+            }
+
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Option<Message> {
+        loop {
+            let item = self
+                .queue
+                .state
+                .lock()
+                .expect("queue lock poisoned")
+                .pop_front()?;
+            if let Some(message) = outgoing_to_message(item) {
+                return Some(message);
             }
         }
     }
 }
 
+impl Drop for ConnectionReceiver {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().expect("queue lock poisoned");
+        state.receiver_closed = true;
+        state.entries.clear();
+        state.queued_ephemeral = 0;
+    }
+}
+
+fn outgoing_to_message(item: Outgoing) -> Option<Message> {
+    match item {
+        Outgoing::Frame(frame) => serde_json::to_string(&frame)
+            .ok()
+            .map(|json| Message::Text(json.into())),
+        Outgoing::Ephemeral { message, .. } => Some(message),
+    }
+}
+
 pub(crate) fn connection_channel() -> (ConnectionSender, ConnectionReceiver) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let queued_ephemeral = Arc::new(AtomicUsize::new(0));
+    let queue = Arc::new(ConnectionQueue::default());
     (
         ConnectionSender {
-            tx,
-            queued_ephemeral: queued_ephemeral.clone(),
+            inner: Arc::new(SenderGuard(queue.clone())),
         },
-        ConnectionReceiver {
-            rx,
-            queued_ephemeral,
-        },
+        ConnectionReceiver { queue },
     )
 }
 
@@ -195,12 +333,13 @@ impl Hub {
         relay_id: &str,
         endpoint: Endpoint,
         target_device_id: Option<&str>,
+        replace_key: Option<&str>,
         message: Message,
         size: usize,
     ) -> usize {
         self.matching(relay_id, endpoint, target_device_id)
             .into_iter()
-            .filter(|tx| tx.send_ephemeral(message.clone(), size))
+            .filter(|tx| tx.send_ephemeral(message.clone(), size, replace_key))
             .count()
     }
 
@@ -337,8 +476,8 @@ mod tests {
         assert_eq!(frame(&mut rx2).await, Some(test_frame));
 
         // dev1 and dev3 must NOT receive the frame
-        assert!(rx1.rx.try_recv().is_err());
-        assert!(rx3.rx.try_recv().is_err());
+        assert!(rx1.try_recv().is_none());
+        assert!(rx3.try_recv().is_none());
 
         // Register dev4 also on (pair-1, Endpoint::Two)
         let (tx4, mut rx4) = connection_channel();
@@ -354,7 +493,7 @@ mod tests {
         // dev4 receives it
         assert_eq!(frame(&mut rx4).await, Some(targeted_frame));
         // dev2 does NOT receive it!
-        assert!(rx2.rx.try_recv().is_err());
+        assert!(rx2.try_recv().is_none());
     }
 
     #[tokio::test]
@@ -395,7 +534,7 @@ mod tests {
 
         let send = |target, size| {
             let message = Message::Binary(vec![0; 4].into());
-            hub.send_ephemeral("pair-e", Endpoint::Two, target, message, size)
+            hub.send_ephemeral("pair-e", Endpoint::Two, target, None, message, size)
         };
         // An empty queue accepts even a message as large as the whole budget.
         assert_eq!(send(None, MAX_QUEUED_EPHEMERAL_BYTES), 1);
@@ -405,5 +544,148 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(Message::Binary(_))));
         assert_eq!(send(None, 1), 1);
         assert_eq!(send(Some("tablet"), 1), 0);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_coalesces_same_replace_key_and_preserves_other_messages() {
+        let hub = Hub::default();
+        let (tx, mut rx) = connection_channel();
+        hub.register("pair-c", Endpoint::Two, "phone", tx, false, Vec::new());
+        assert!(matches!(frame(&mut rx).await, Some(ServerFrame::Ready { .. })));
+
+        let send_eph = |key: Option<&str>, bytes: &'static [u8]| {
+            assert_eq!(
+                hub.send_ephemeral(
+                    "pair-c",
+                    Endpoint::Two,
+                    None,
+                    key,
+                    Message::Binary(bytes.into()),
+                    bytes.len(),
+                ),
+                1
+            );
+        };
+        let send_durable = |id: &str, seq: u64| {
+            hub.send_to_endpoint(
+                "pair-c",
+                Endpoint::Two,
+                None,
+                ServerFrame::Message {
+                    message_id: id.into(),
+                    sequence: seq,
+                    payload: serde_json::json!(seq),
+                },
+            );
+        };
+
+        send_durable("d1", 1);
+        send_eph(Some("screen"), b"s1");
+        send_eph(Some("cursor"), b"c1");
+        send_eph(None, b"unkeyed-1");
+        send_eph(Some("screen"), b"s2");
+        send_durable("d2", 2);
+        send_eph(Some("screen"), b"s3");
+        send_eph(None, b"unkeyed-2");
+
+        // In-place replacement updates the queued "screen" slot to s3 without
+        // reordering durable messages, distinct keys, or non-keyed frames.
+        assert!(matches!(
+            frame(&mut rx).await,
+            Some(ServerFrame::Message { sequence: 1, .. })
+        ));
+        assert_eq!(rx.recv().await, Some(Message::Binary(b"s3".as_slice().into())));
+        assert_eq!(rx.recv().await, Some(Message::Binary(b"c1".as_slice().into())));
+        assert_eq!(
+            rx.recv().await,
+            Some(Message::Binary(b"unkeyed-1".as_slice().into()))
+        );
+        assert!(matches!(
+            frame(&mut rx).await,
+            Some(ServerFrame::Message { sequence: 2, .. })
+        ));
+        assert_eq!(
+            rx.recv().await,
+            Some(Message::Binary(b"unkeyed-2".as_slice().into()))
+        );
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_replace_key_accounts_for_replaced_bytes_in_budget() {
+        let hub = Hub::default();
+        let (tx, mut rx) = connection_channel();
+        hub.register("pair-b", Endpoint::Two, "phone", tx, false, Vec::new());
+        assert!(matches!(frame(&mut rx).await, Some(ServerFrame::Ready { .. })));
+
+        // Fill the entire budget with one keyed frame.
+        assert_eq!(
+            hub.send_ephemeral(
+                "pair-b",
+                Endpoint::Two,
+                None,
+                Some("screen"),
+                Message::Binary(b"old".as_slice().into()),
+                MAX_QUEUED_EPHEMERAL_BYTES,
+            ),
+            1
+        );
+        // A different key cannot fit while the budget is full.
+        assert_eq!(
+            hub.send_ephemeral(
+                "pair-b",
+                Endpoint::Two,
+                None,
+                Some("other"),
+                Message::Binary(b"x".as_slice().into()),
+                1,
+            ),
+            0
+        );
+        // Replacing the existing key reuses its reserved bytes even at full budget.
+        assert_eq!(
+            hub.send_ephemeral(
+                "pair-b",
+                Endpoint::Two,
+                None,
+                Some("screen"),
+                Message::Binary(b"new-large".as_slice().into()),
+                MAX_QUEUED_EPHEMERAL_BYTES,
+            ),
+            1
+        );
+        // Replacing with a smaller frame frees budget for other keys.
+        assert_eq!(
+            hub.send_ephemeral(
+                "pair-b",
+                Endpoint::Two,
+                None,
+                Some("screen"),
+                Message::Binary(b"small".as_slice().into()),
+                100,
+            ),
+            1
+        );
+        assert_eq!(
+            hub.send_ephemeral(
+                "pair-b",
+                Endpoint::Two,
+                None,
+                Some("other"),
+                Message::Binary(b"fits".as_slice().into()),
+                100,
+            ),
+            1
+        );
+
+        assert_eq!(
+            rx.recv().await,
+            Some(Message::Binary(b"small".as_slice().into()))
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(Message::Binary(b"fits".as_slice().into()))
+        );
+        assert!(rx.try_recv().is_none());
     }
 }

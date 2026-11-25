@@ -269,6 +269,7 @@ async fn replays_only_unacked_messages_after_server_restart() {
             payload: json!(7),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await;
@@ -398,6 +399,7 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
             payload: json!({ "old": 1 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await;
@@ -410,6 +412,7 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
             payload: json!({ "old": 2 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await;
@@ -437,6 +440,7 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
             payload: json!({ "live": 3 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await;
@@ -490,6 +494,7 @@ async fn rejected_message_does_not_poison_outbox_or_disconnect_client() {
             payload: json!({ "valid": 1 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await;

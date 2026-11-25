@@ -169,12 +169,15 @@ where
     /// acknowledgement. Fails while disconnected; delivery failures are
     /// reported through [`ClientHandler::on_undeliverable`]. Pass `message_id`
     /// to correlate that callback with an id of your own (non-empty, at most
-    /// 256 bytes); otherwise a random one is generated. Returns the message id.
+    /// 256 bytes); otherwise a random one is generated. Pass `replace_key`
+    /// (non-empty, at most 256 bytes) to coalesce unsent frames with the same
+    /// key. Returns the message id.
     pub async fn send_ephemeral(
         &self,
         payload: Value,
         target_device_id: Option<String>,
         message_id: Option<String>,
+        replace_key: Option<String>,
     ) -> anyhow::Result<String> {
         let message_id = message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.live_sender()?
@@ -183,6 +186,7 @@ where
                 payload,
                 target_device_id,
                 ephemeral: true,
+                replace_key,
             })
             .await?;
         Ok(message_id)
@@ -194,11 +198,13 @@ where
         body: &[u8],
         target_device_id: Option<String>,
         message_id: Option<String>,
+        replace_key: Option<String>,
     ) -> anyhow::Result<String> {
         let message_id = message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let header = relay_frame::BinaryHeader {
             message_id: message_id.clone(),
             target_device_id,
+            replace_key,
         };
         self.live_sender()?.send_binary(&header, body).await?;
         Ok(message_id)
@@ -405,6 +411,7 @@ where
                         payload: message.payload,
                         target_device_id: message.target_device_id,
                         ephemeral: false,
+                        replace_key: None,
                     })
                     .await?;
             }
@@ -447,6 +454,8 @@ pub mod relay_frame {
             target_device_id: Option<String>,
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
             ephemeral: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            replace_key: Option<String>,
         },
         /// Cumulative acknowledgement for all received sequences up to this one.
         Ack {
@@ -505,6 +514,8 @@ pub mod relay_frame {
         pub message_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub target_device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub replace_key: Option<String>,
     }
 
     pub fn encode_binary_frame(header: &BinaryHeader, body: &[u8]) -> Vec<u8> {

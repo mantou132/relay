@@ -41,7 +41,7 @@ export type ServerFrame =
   | { type: 'peer_disconnected'; device_id: string };
 
 export type ClientFrame =
-  | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string; ephemeral?: boolean }
+  | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string; ephemeral?: boolean; replace_key?: string }
   | { type: 'ack'; sequence: number };
 
 /** Persistence for outbound messages and the receive cursor. */
@@ -122,7 +122,7 @@ export const isNewSequence = (lastReceived: number | undefined, sequence: number
   return true;
 };
 
-export type BinaryHeader = { message_id: string; target_device_id?: string };
+export type BinaryHeader = { message_id: string; target_device_id?: string; replace_key?: string };
 
 /** Binary frame layout: `[u16 big-endian header length][header JSON][body]`. */
 export const encodeBinaryFrame = (header: BinaryHeader, body: Uint8Array): Uint8Array<ArrayBuffer> => {
@@ -346,8 +346,14 @@ export class RelayClient {
   /**
    * Sends over the live connection without storage or acknowledgement; returns the message id.
    * Pass `messageId` to correlate `onUndeliverable` with an id of your own (non-empty, at most 256 bytes).
+   * Pass `replaceKey` (non-empty, at most 256 bytes) to replace any unsent frame with the same key in the relay's outbound queue.
    */
-  sendEphemeral = (payload: unknown, targetDeviceId?: string, messageId: string = crypto.randomUUID()) => {
+  sendEphemeral = (
+    payload: unknown,
+    targetDeviceId?: string,
+    messageId: string = crypto.randomUUID(),
+    replaceKey?: string,
+  ) => {
     this.#liveSocket().send(
       JSON.stringify({
         type: 'message',
@@ -355,16 +361,23 @@ export class RelayClient {
         payload,
         ...(targetDeviceId ? { target_device_id: targetDeviceId } : {}),
         ephemeral: true,
+        ...(replaceKey !== undefined ? { replace_key: replaceKey } : {}),
       } satisfies ClientFrame),
     );
     return messageId;
   };
 
   /** Sends bytes as an ephemeral binary frame; see `sendEphemeral`. */
-  sendBinary = (data: Uint8Array, targetDeviceId?: string, messageId: string = crypto.randomUUID()) => {
+  sendBinary = (
+    data: Uint8Array,
+    targetDeviceId?: string,
+    messageId: string = crypto.randomUUID(),
+    replaceKey?: string,
+  ) => {
     const header: BinaryHeader = {
       message_id: messageId,
       ...(targetDeviceId ? { target_device_id: targetDeviceId } : {}),
+      ...(replaceKey !== undefined ? { replace_key: replaceKey } : {}),
     };
     this.#liveSocket().send(encodeBinaryFrame(header, data));
     return messageId;

@@ -135,6 +135,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             payload: json!({ "request": 1 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -154,6 +155,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             payload: json!({ "pair": "b" }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -197,6 +199,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
             payload: json!({ "request": 2 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -243,6 +246,7 @@ async fn debug_logs_connections_messages_and_disconnects() {
             payload: json!({ "hello": "logs" }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -286,6 +290,7 @@ async fn ack_head_purges_stale_messages_on_connect() {
             payload: json!({ "count": 1 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -304,6 +309,7 @@ async fn ack_head_purges_stale_messages_on_connect() {
             payload: json!({ "count": 2 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -328,6 +334,7 @@ async fn ack_head_purges_stale_messages_on_connect() {
             payload: json!({ "count": 3 }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await

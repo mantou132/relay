@@ -111,6 +111,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             payload: json!({ "content": "broadcast_to_both" }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -160,6 +161,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             payload: json!({ "content": "offline_for_b" }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -209,6 +211,7 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             payload: json!({ "content": "seamless_continuation" }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -269,6 +272,7 @@ async fn same_device_reconnection_preempts_old_socket() {
             payload: json!({ "live": true }),
             target_device_id: None,
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -347,6 +351,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             payload: json!({ "msg": "only_for_a" }),
             target_device_id: Some("phone_a".to_string()),
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -381,6 +386,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             payload: json!({ "msg": "only_for_b" }),
             target_device_id: Some("phone_b".to_string()),
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await
@@ -415,6 +421,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             payload: json!({ "msg": "offline_for_a" }),
             target_device_id: Some("phone_a".to_string()),
             ephemeral: false,
+            replace_key: None,
         },
     )
     .await

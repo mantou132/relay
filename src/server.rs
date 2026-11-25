@@ -263,6 +263,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                         debug!(
                             message_id = %header.message_id,
                             target_device_id = ?header.target_device_id,
+                            replace_key = ?header.replace_key,
                             body_bytes = bytes.len() - body_start,
                             "binary message received"
                         );
@@ -274,6 +275,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                             &tx,
                             header.message_id,
                             header.target_device_id.as_deref(),
+                            header.replace_key.as_deref(),
                             Message::Binary(bytes),
                             size,
                         );
@@ -305,8 +307,9 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 payload,
                 target_device_id,
                 ephemeral: true,
+                replace_key,
             } => {
-                debug!(%message_id, ?target_device_id, payload = %payload, "ephemeral message received");
+                debug!(%message_id, ?target_device_id, ?replace_key, payload = %payload, "ephemeral message received");
                 let frame = ServerFrame::Ephemeral {
                     message_id: message_id.clone(),
                     payload,
@@ -321,6 +324,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     &tx,
                     message_id,
                     target_device_id.as_deref(),
+                    replace_key.as_deref(),
                     Message::Text(json.into()),
                     size,
                 );
@@ -330,7 +334,16 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 payload,
                 target_device_id,
                 ephemeral: false,
+                replace_key,
             } => {
+                if replace_key.is_some() {
+                    debug!(%message_id, "durable message rejected: replace_key is only supported for ephemeral messages");
+                    tx.send(ServerFrame::Rejected {
+                        message_id,
+                        reason: "replace_key is only supported for ephemeral messages".to_string(),
+                    });
+                    continue;
+                }
                 debug!(%message_id, ?target_device_id, payload = %payload, "message received");
                 let _delivery = state.delivery.lock(&query.id).await;
                 match state
@@ -411,19 +424,28 @@ fn notify_presence(state: &AppState, query: &ConnectQuery, kind: EventKind) {
     }
 }
 
+fn validate_replace_key(replace_key: &str) -> Result<()> {
+    anyhow::ensure!(!replace_key.is_empty(), "replace_key must not be empty");
+    anyhow::ensure!(replace_key.len() <= MAX_ID_BYTES, "replace_key is too long");
+    Ok(())
+}
+
 /// Delivers an ephemeral message to the peer endpoint's live devices without
 /// storage. The sender only hears back when no device received it.
+#[allow(clippy::too_many_arguments)]
 fn forward_ephemeral(
     state: &AppState,
     query: &ConnectQuery,
     tx: &ConnectionSender,
     message_id: String,
     target_device_id: Option<&str>,
+    replace_key: Option<&str>,
     message: Message,
     size: usize,
 ) {
     let valid = validate_message_id(&message_id)
-        .and_then(|()| target_device_id.map_or(Ok(()), validate_target_device_id));
+        .and_then(|()| target_device_id.map_or(Ok(()), validate_target_device_id))
+        .and_then(|()| replace_key.map_or(Ok(()), validate_replace_key));
     if let Err(error) = valid {
         debug!(%message_id, %error, "ephemeral message rejected");
         tx.send(ServerFrame::Rejected {
@@ -436,6 +458,7 @@ fn forward_ephemeral(
         &query.id,
         query.endpoint.opposite(),
         target_device_id,
+        replace_key,
         message,
         size,
     );

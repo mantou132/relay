@@ -44,6 +44,11 @@ pub enum ClientFrame {
         /// `stored`, sequence, or acknowledgement.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ephemeral: bool,
+        /// Optional coalescing key for ephemeral messages. If an unsent
+        /// ephemeral message with the same key is still queued for a receiver,
+        /// this message replaces it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replace_key: Option<String>,
     },
     /// Cumulative acknowledgement for all received sequences up to this one.
     Ack {
@@ -118,6 +123,8 @@ pub struct BinaryHeader {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_key: Option<String>,
 }
 
 pub fn encode_binary_frame(header: &BinaryHeader, body: &[u8]) -> Vec<u8> {

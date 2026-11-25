@@ -159,6 +159,7 @@ Client to server:
 {"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"}}
 {"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"},"target_device_id":"phone_a"}
 {"type":"message","message_id":"client-generated-id","payload":{"any":"json"},"ephemeral":true}
+{"type":"message","message_id":"client-generated-id","payload":{"any":"json"},"ephemeral":true,"replace_key":"cursor"}
 {"type":"ack","sequence":42}
 ```
 
@@ -181,12 +182,16 @@ Server to client:
 `payload` may be any JSON value. `message_id` must be non-empty, stable across
 retries, and no longer than 256 bytes. `target_device_id` is an optional string
 specifying a target device on the opposite endpoint; if omitted, the message
-is broadcast to all active devices on that endpoint. WebSocket messages are limited to 10 MiB.
+is broadcast to all active devices on that endpoint. `replace_key` is an
+optional non-empty string (max 256 bytes) valid only on ephemeral messages
+(durable messages specifying `replace_key` are rejected). WebSocket messages
+are limited to 10 MiB.
 
 Binary WebSocket messages, in both directions, are laid out as
 `[u16 big-endian header length][header JSON][body]`, where the header is
-`{"message_id":"...","target_device_id":"..."}` (`target_device_id` optional).
-They are always ephemeral, and the relay forwards them unchanged.
+`{"message_id":"...","target_device_id":"...","replace_key":"..."}`
+(`target_device_id` and `replace_key` optional). They are always ephemeral, and
+the relay forwards them unchanged.
 
 ## Ephemeral delivery
 
@@ -198,6 +203,12 @@ that is only useful while both sides are online:
   written to SQLite, and no `stored`, sequence, `ack`, or replay is involved.
 - Ephemeral text arrives as `{"type":"ephemeral",...}`; binary arrives in the
   same binary layout it was sent in.
+- If `replace_key` is set and a peer's outbound send queue already holds an
+  unsent ephemeral frame with the same `replace_key`, the older unsent frame is
+  dropped and replaced with the newer one (latest-wins coalescing). This keeps
+  high-frequency streams (such as live screen frames) fresh on slow links
+  without affecting durable messages, non-keyed ephemeral messages, or distinct
+  keys, and without emitting `undeliverable` for superseded frames.
 - If no device accepts the message, the sender receives `undeliverable`. That
   happens when no matching device is connected, or when every match already
   has 16 MiB of ephemeral data queued, so that a slow receiver cannot grow
@@ -281,7 +292,7 @@ returned to the filesystem.
 
 The repository includes official clients for Rust and TypeScript/JavaScript implementing the full delivery contract (persistent outbox, automatic retries until `stored`, cumulative acknowledgments, exponential backoff, and preemption handling). Both ignore server frame types and fields they do not know, so a newer relay can add frames without disconnecting them. The Rust client does so since this release; older Rust clients disconnect on an unknown frame type, which is why new frame types such as presence stay opt-in.
 
-Both clients also send ephemeral messages (`send_ephemeral` / `send_binary` in Rust, `sendEphemeral` / `sendBinary` in TypeScript). These skip the outbox and fail immediately while the relay is not connected. Both take an optional message id (`message_id: Option<String>` in Rust, a third `messageId` argument in TypeScript), so an application can match `on_undeliverable` / `onUndeliverable` against its own ids. Ephemeral text is delivered through the regular payload callback, binary through `on_binary` / `onBinary`, and failed deliveries through `on_undeliverable` / `onUndeliverable`.
+Both clients also send ephemeral messages (`send_ephemeral` / `send_binary` in Rust, `sendEphemeral` / `sendBinary` in TypeScript). These skip the outbox and fail immediately while the relay is not connected. Both take an optional message id (`message_id: Option<String>` in Rust, a third `messageId` argument in TypeScript), so an application can match `on_undeliverable` / `onUndeliverable` against its own ids, and an optional coalescing key (`replace_key: Option<String>` in Rust, a fourth `replaceKey` argument in TypeScript) so unsent frames with the same key are replaced in place. Ephemeral text is delivered through the regular payload callback, binary through `on_binary` / `onBinary`, and failed deliveries through `on_undeliverable` / `onUndeliverable`.
 
 For [peer presence](#peer-presence), call `Client::with_presence()` and implement `on_peer_connected` / `on_peer_disconnected` in Rust, or pass `onPeerConnected` / `onPeerDisconnected` in TypeScript, which subscribes automatically and exposes the current set as `client.peers` (`undefined` while not connected, or when the relay predates presence). The `ready` snapshot is reported through the same callback, right before the connected state (`on_connected` / `onStateChange('connected')`), so the online set is complete when a client learns it is connected. A peer that replaces its connection is reported connected again without a disconnect in between, since its session may have restarted. When the client's own connection ends, both report every known peer disconnected, so the callbacks always describe a consistent online set.
 
@@ -347,10 +358,12 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Ephemeral JSON and bytes: live connection only, no outbox
-    client.send_ephemeral(json!({ "typing": true }), None, None).await?;
-    client.send_binary(&[0x89, 0x50, 0x4e, 0x47], Some("phone_a".to_string()), None).await?;
+    client.send_ephemeral(json!({ "typing": true }), None, None, None).await?;
+    client.send_binary(&[0x89, 0x50, 0x4e, 0x47], Some("phone_a".to_string()), None, None).await?;
     // Optional own message id, reported back by on_undeliverable
-    client.send_ephemeral(json!({ "request": 1 }), None, Some("request-1".to_string())).await?;
+    client.send_ephemeral(json!({ "request": 1 }), None, Some("request-1".to_string()), None).await?;
+    // Optional replace_key: latest unsent frame per key wins on slow links
+    client.send_binary(&[0x89, 0x50, 0x4e, 0x47], Some("phone_a".to_string()), None, Some("live-view".to_string())).await?;
 
     // Close client when done (disconnects and exits run loop)
     // client.close();
@@ -409,6 +422,8 @@ client.sendEphemeral({ typing: true });
 client.sendBinary(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), 'desktop');
 // Optional own message id, reported back by onUndeliverable
 client.sendEphemeral({ request: 1 }, undefined, 'request-1');
+// Optional replaceKey: latest unsent frame per key wins on slow links
+client.sendBinary(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), 'desktop', undefined, 'live-view');
 
 // Close connection (stops reconnect loop)
 // client.close();
